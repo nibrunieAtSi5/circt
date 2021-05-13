@@ -174,4 +174,12 @@ def BlackBoxReader : Pass<"firrtl-blackbox-reader", "CircuitOp"> {
   let dependentDialects = ["sv::SVDialect"];
 }
 
+def CriticalPathAnalysis : Pass<"firrtl-analyze-critical-path", "firrtl::FModuleOp"> {
+  let summary = "process the module inferring the critical path";
+  let description = [{
+    This pass analyzes a FIRRTL module to determine its critical path.
+  }];
+  let constructor = "circt::firrtl::createCriticalPathAnalysisPass()";
+}
+
 #endif // CIRCT_DIALECT_FIRRTL_PASSES_TD
