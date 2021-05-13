@@ -8,6 +8,7 @@ add_circt_dialect_library(CIRCTFIRRTLTransforms
   InferWidths.cpp
   LowerTypes.cpp
   PrintInstanceGraph.cpp
+  CriticalPathAnalysis.cpp
 
   DEPENDS
   CIRCTFIRRTLTransformsIncGen
