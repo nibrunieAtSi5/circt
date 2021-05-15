@@ -21,6 +21,8 @@
 #include "llvm/Support/Debug.h"
 
 // todo: to be removed
+#include <iostream>
+
 #include <list>
 
 #define DEBUG_TYPE "firrtl-critical-path"
@@ -30,6 +32,26 @@ using namespace firrtl;
 
 namespace {
 
+
+// node in a TimingPath
+class TimingPathNode {
+  public:
+    double nodeLatency;
+    Value nodeValue;
+    TimingPathNode* previousNode;
+    TimingPathNode* nextNode;
+    double pathLatency;
+
+    TimingPathNode(): nodeLatency(0.0), nodeValue(nullptr), previousNode(nullptr),
+                      nextNode(nullptr), pathLatency(0.0) {}
+
+    TimingPathNode(double latency, Value value, TimingPathNode* previous):
+      nodeLatency(latency), nodeValue(value), previousNode(previous), nextNode(nullptr) {
+        nodeValue.dump();
+        pathLatency = (previous ? previousNode->pathLatency : 0.0) + nodeLatency;
+        if (previous) previous->nextNode = this;
+      }
+};
 
 bool isFlippedType(FIRRTLType type) {
   if (auto flip = type.dyn_cast<FlipType>())
@@ -44,7 +66,6 @@ bool isInputField(FIRRTLType type, StringRef name) {
   }
   TypeSwitch<FIRRTLType>(type)
         .Case<BundleType>([&](auto bundle) {
-
           // Otherwise, we have a bundle type.  Break it down.
           for (auto &elt : bundle.getElements()) {
             if (elt.name.getValue() == name) {
@@ -89,8 +110,6 @@ void CriticalPathAnalysisPass::runOnOperation() {
   }
 
   std::list<Operation*> worklist;
-  double maxOpLatency = 0.0;
-  Operation* criticalPathEnd = nullptr;
 
   struct ExprInitialLatencyEvaluator : public FIRRTLVisitor<ExprInitialLatencyEvaluator, double> {
     using FIRRTLVisitor<ExprInitialLatencyEvaluator, double>::visitExpr;
@@ -120,16 +139,17 @@ void CriticalPathAnalysisPass::runOnOperation() {
   struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
   public:
     // llvm::DenseMap<Operation, double> opsLatency;
-    llvm::DenseMap<Value, double> valuesLatency;
+    llvm::DenseMap<Value, TimingPathNode> valuesLatency;
 
     using FIRRTLVisitor<ExprLatencyEvaluator, bool>::visitExpr;
     using FIRRTLVisitor<ExprLatencyEvaluator, bool>::visitStmt;
 
-    bool visitInvalidExpr(Operation *op) { return false; }
+    // this callback ends the chain of visitInvalidExpr -> visitInvalidStmt -> visitInvalidDecl
+    bool visitInvalidDecl(Operation *op) { return false; }
     bool visitUnhandledExpr(Operation *op) { return false; }
     // constant operation have zero-latency
     bool visitExpr(ConstantOp op) {
-      valuesLatency[op->getOpResult(0)] = 0.0;
+      valuesLatency[op->getOpResult(0)] = TimingPathNode(0.0, op->getOpResult(0), nullptr);
       return true;
      }
 
@@ -138,7 +158,7 @@ void CriticalPathAnalysisPass::runOnOperation() {
       auto field = op.fieldname();
       LLVM_DEBUG(llvm::dbgs()
                 << "SubField's fieldname is " << field << " \n");
-      double latency = -1.0;
+      TimingPathNode* previous = nullptr;
       if (input.isa<BlockArgument>()) {
 
         LLVM_DEBUG(llvm::dbgs()
@@ -147,86 +167,118 @@ void CriticalPathAnalysisPass::runOnOperation() {
         //if (auto flipType = input.getType().dyn_cast<firrtl::FlipType>()) {
           LLVM_DEBUG(llvm::dbgs() << "field type is flipped=" << isInput << "\n.");
         //}
-        latency = 0.0;
       } else {
         auto it = valuesLatency.find(input);
-        if (it == valuesLatency.end() || it->second < 0) return false;
-        latency = it->second;
+        if (it == valuesLatency.end() || it->second.pathLatency < 0) return false;
+        previous = &(it->second);
       }
+      TimingPathNode pathNode = TimingPathNode(0.0, op->getOpResult(0), previous);
       LLVM_DEBUG(llvm::dbgs()
-                << "Inner Found latency " << latency << " for op " << op->getName().getStringRef().str() << "\n");
-      valuesLatency[op->getOpResult(0)] = latency;
+                << "Inner Found latency " << pathNode.pathLatency << " for op " << op->getName().getStringRef().str() << "\n");
+      valuesLatency[op->getOpResult(0)] = pathNode;
       return true;
     }
-    bool visitExpr(XorPrimOp op) {
-      double maxLatency = 0.0;
+
+    // visit generic multi-ary bitwise operation (e.g. Xor, And ...)
+    bool visitMultiAryBitwiseOp(Operation* op, const double opClassLatency) {
+      TimingPathNode* longestPath = nullptr;
       for (auto operand: op->getOperands()) {
         auto it = valuesLatency.find(operand);
-        if (it == valuesLatency.end() || it->second < 0) return false;
-        double operandLatency = it->second;
-        if (operandLatency > maxLatency)
-          maxLatency = operandLatency;
+        if (it == valuesLatency.end() || it->second.pathLatency < 0) return false;
+        double operandLatency = it->second.pathLatency;
+        if (nullptr == longestPath || operandLatency > longestPath->pathLatency)
+          longestPath = &(it->second);
       }
-      const double latency_xor = 2.0;
       op->getOpResult(0).dump();
-      valuesLatency[op->getOpResult(0)] = maxLatency + latency_xor;
+      valuesLatency[op->getOpResult(0)] = TimingPathNode(opClassLatency, op->getOpResult(0), longestPath);
       return true;
+
+    }
+
+    bool visitExpr(XorPrimOp op) {
+      const double latency_xor = 2.0;
+      return visitMultiAryBitwiseOp(op, latency_xor);
     }
     bool visitExpr(AndPrimOp op) {
-      double maxLatency = 0.0;
-      for (auto operand: op->getOperands()) {
-        auto it = valuesLatency.find(operand);
-        if (it == valuesLatency.end() || it->second < 0) return false;
-        double operandLatency = it->second;
-        if (operandLatency > maxLatency)
-          maxLatency = operandLatency;
-      }
       const double latency_and = 2.0;
-      op->getOpResult(0).dump();
-      valuesLatency[op->getOpResult(0)] = maxLatency + latency_and;
-      return true;
+      return visitMultiAryBitwiseOp(op, latency_and);
     }
     bool visitStmt(ConnectOp op) {
       auto it = valuesLatency.find(op.src());
-      if (it == valuesLatency.end() || it->second < 0) return false;
-      double latency = it->second;
-      valuesLatency[op.dest()] = latency;
+    LLVM_DEBUG(llvm::dbgs()
+               << "Processing connect\n");
+      op.src().dump();
+      if (it == valuesLatency.end() || it->second.pathLatency < 0) return false;
+      valuesLatency[op.dest()] = TimingPathNode(0.0, op.dest(), &(it->second));
       return true;
     }
   };
 
   auto latencyEvaluator = ExprLatencyEvaluator();
-  int watchdog = 20;
+  TimingPathNode* criticalPathEnd = nullptr;
+  // int watchdog = 20;
   while (!worklist.empty()) {
     Operation* op = worklist.front();
     LLVM_DEBUG(llvm::dbgs()
                << "Processing " << op->getName().getStringRef().str() << "\n");
     worklist.pop_front();
+
+    if (auto mod = dyn_cast<FModuleOp>(op)) {
+      LLVM_DEBUG(llvm::dbgs()
+                << "Found to discard: " << op->getName().getStringRef().str() << "\n");
+      continue;
+    }
+
     bool latencyFound = latencyEvaluator.dispatchExprVisitor(op);
 
     if (latencyFound) {
       auto it = latencyEvaluator.valuesLatency.find(op->getOpResult(0));
-      LLVM_DEBUG(llvm::dbgs()
-                << "Found latency " << it->second << " for op " << op->getName().getStringRef().str() << "\n");
+      if (it == latencyEvaluator.valuesLatency.end()) {
+        LLVM_DEBUG(llvm::dbgs()
+                  << "invalid latency for op " << op->getName().getStringRef().str() << "\n");
+
+      } else {
+        if (nullptr == criticalPathEnd || criticalPathEnd->pathLatency < it->second.pathLatency)
+        criticalPathEnd = &(it->second);
+        LLVM_DEBUG(llvm::dbgs()
+                  << "Found latency " << it->second.pathLatency << " for op " << op->getName().getStringRef().str() << "\n");
+      }
 
     } else {
       worklist.push_back(op);
     }
 
-    if (watchdog-- < 0) break;
+    // if (watchdog-- < 0) break;
 
   }
   for (auto it : latencyEvaluator.valuesLatency) {
     LLVM_DEBUG(llvm::dbgs()
-               << "latency is " << it.second << "\n");
+               << "latency is " << it.second.pathLatency << "\n");
 
   }
 
-  // LLVM_DEBUG(llvm::dbgs()
-  //           << "critical path's end is " << criticalPathEnd->getName().getStringRef().str() << "\n");
+  // todo: need a more canonical part to display result info
+  // critical path traversal
+  // start by looking for path start
+  TimingPathNode* criticalPathStart = criticalPathEnd;
+  llvm::outs() << "Rewiding critical path:\n";
+  while (criticalPathStart != nullptr) {
+    llvm::outs() << "  Found new node.\n";
+    criticalPathStart = criticalPathStart->previousNode;
+  }
+  llvm::outs() << "critical path is:\n";
+  criticalPathEnd->nodeValue.dump();
+  criticalPathStart->nodeValue.dump();
+  for (int index = 0; ; index++) {
+    if (criticalPathStart == nullptr) break;
+    llvm::outs() << "#" << index << ": ";
+    // criticalPathStart->nodeValue.dump(); //print(llvm::outs());
+    llvm::outs() << "\n";
+    criticalPathStart = criticalPathStart->nextNode;
+  }
 
-  // looking for critical path
 
+  // todo: keep ?
   markAllAnalysesPreserved();
 }
 
