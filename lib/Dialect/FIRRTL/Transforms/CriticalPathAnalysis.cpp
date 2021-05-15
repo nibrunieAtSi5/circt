@@ -29,13 +29,44 @@ using namespace circt;
 using namespace firrtl;
 
 namespace {
+
+
+bool isFlippedType(FIRRTLType type) {
+  if (auto flip = type.dyn_cast<FlipType>())
+    return true;
+  return false;
+}
+
+// check if field <name> in aggregate format <type> is an input or not
+bool isInputField(FIRRTLType type, StringRef name) {
+  if (auto flip = type.dyn_cast<FlipType>()) {
+    return !isInputField(flip.getElementType(), name);
+  }
+  TypeSwitch<FIRRTLType>(type)
+        .Case<BundleType>([&](auto bundle) {
+
+          // Otherwise, we have a bundle type.  Break it down.
+          for (auto &elt : bundle.getElements()) {
+            if (elt.name.getValue() == name) {
+              return isFlippedType(elt.type);
+            }
+          }
+          // todo: field not found
+          return false;
+        })
+        .Default([&](auto) {
+          return false;
+        });
+
+    return false;
+}
+
+
 /// A simple pass that emits errors for any occurrences of `uint`, `sint`, or
 /// `analog` without a known width.
 class CriticalPathAnalysisPass : public CriticalPathAnalysisBase<CriticalPathAnalysisPass> {
   void runOnOperation() override;
 
-  // llvm::DenseMap<Operation, double> opsLatency;
-  llvm::DenseMap<Value, double> valuesLatency;
 
   /// Whether any checks have failed.
   bool anyFailed;
@@ -81,84 +112,113 @@ void CriticalPathAnalysisPass::runOnOperation() {
     LLVM_DEBUG(llvm::dbgs()
                << "latency for op  " << op->getName().getStringRef().str() << " has been evaluated to " << latency << "\n");
     // opsLatency[op] = latency;
-    valuesLatency[op->getOpResult(0)] = latency;
+    // valuesLatency[op->getOpResult(0)] = latency;
     // enqueue operations for which latency was not determined
     if (latency < 0)
       worklist.push_back(op);
   });
-  struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool, llvm::DenseMap<Value, double>> {
-    using FIRRTLVisitor<ExprLatencyEvaluator, bool, llvm::DenseMap<Value, double>>::visitExpr;
-    using FIRRTLVisitor<ExprLatencyEvaluator, bool, llvm::DenseMap<Value, double>>::visitStmt;
+  struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
+  public:
+    // llvm::DenseMap<Operation, double> opsLatency;
+    llvm::DenseMap<Value, double> valuesLatency;
 
-    bool visitInvalidExpr(Operation *op, llvm::DenseMap<Value, double> latencyMap) { return false; }
-    bool visitUnhandledExpr(Operation *op, llvm::DenseMap<Value, double> latencyMap) { return false; }
+    using FIRRTLVisitor<ExprLatencyEvaluator, bool>::visitExpr;
+    using FIRRTLVisitor<ExprLatencyEvaluator, bool>::visitStmt;
+
+    bool visitInvalidExpr(Operation *op) { return false; }
+    bool visitUnhandledExpr(Operation *op) { return false; }
     // constant operation have zero-latency
-    bool visitExpr(ConstantOp op, llvm::DenseMap<Value, double> latencyMap) {
-      latencyMap[op->getOpResult(0)] = 0.0;
+    bool visitExpr(ConstantOp op) {
+      valuesLatency[op->getOpResult(0)] = 0.0;
       return true;
      }
 
-    bool visitExpr(SubfieldOp op, llvm::DenseMap<Value, double> latencyMap) {
+    bool visitExpr(SubfieldOp op) {
       auto input = op.input();
-      auto it = latencyMap.find(input);
-      if (it == latencyMap.end()) return false;
-      double latency = it->second;
-      latencyMap[op->getOpResult(0)] = latency;
+      auto field = op.fieldname();
+      LLVM_DEBUG(llvm::dbgs()
+                << "SubField's fieldname is " << field << " \n");
+      double latency = -1.0;
+      if (input.isa<BlockArgument>()) {
+
+        LLVM_DEBUG(llvm::dbgs()
+                  << "SubField's input is a BlockArgument. " << input.getType() << " \n");
+        bool isInput = isInputField(input.getType().dyn_cast<FIRRTLType>(), field);
+        //if (auto flipType = input.getType().dyn_cast<firrtl::FlipType>()) {
+          LLVM_DEBUG(llvm::dbgs() << "field type is flipped=" << isInput << "\n.");
+        //}
+        latency = 0.0;
+      } else {
+        auto it = valuesLatency.find(input);
+        if (it == valuesLatency.end() || it->second < 0) return false;
+        latency = it->second;
+      }
+      LLVM_DEBUG(llvm::dbgs()
+                << "Inner Found latency " << latency << " for op " << op->getName().getStringRef().str() << "\n");
+      valuesLatency[op->getOpResult(0)] = latency;
       return true;
     }
-    bool visitExpr(XorPrimOp op, llvm::DenseMap<Value, double> latencyMap) {
+    bool visitExpr(XorPrimOp op) {
       double maxLatency = 0.0;
       for (auto operand: op->getOperands()) {
-        auto it = latencyMap.find(operand);
-        if (it == latencyMap.end()) return false;
+        auto it = valuesLatency.find(operand);
+        if (it == valuesLatency.end() || it->second < 0) return false;
         double operandLatency = it->second;
         if (operandLatency > maxLatency)
           maxLatency = operandLatency;
       }
       const double latency_xor = 2.0;
       op->getOpResult(0).dump();
-      latencyMap[op->getOpResult(0)] = maxLatency + latency_xor;
+      valuesLatency[op->getOpResult(0)] = maxLatency + latency_xor;
       return true;
     }
-    bool visitExpr(AndPrimOp op, llvm::DenseMap<Value, double> latencyMap) {
+    bool visitExpr(AndPrimOp op) {
       double maxLatency = 0.0;
       for (auto operand: op->getOperands()) {
-        auto it = latencyMap.find(operand);
-        if (it == latencyMap.end()) return false;
+        auto it = valuesLatency.find(operand);
+        if (it == valuesLatency.end() || it->second < 0) return false;
         double operandLatency = it->second;
         if (operandLatency > maxLatency)
           maxLatency = operandLatency;
       }
       const double latency_and = 2.0;
       op->getOpResult(0).dump();
-      latencyMap[op->getOpResult(0)] = maxLatency + latency_and;
+      valuesLatency[op->getOpResult(0)] = maxLatency + latency_and;
       return true;
     }
-    bool visitStmt(ConnectOp op, llvm::DenseMap<Value, double> latencyMap) {
-      auto it = latencyMap.find(op.src());
-      if (it == latencyMap.end()) return false;
+    bool visitStmt(ConnectOp op) {
+      auto it = valuesLatency.find(op.src());
+      if (it == valuesLatency.end() || it->second < 0) return false;
       double latency = it->second;
-      latencyMap[op.dest()] = latency;
+      valuesLatency[op.dest()] = latency;
       return true;
     }
   };
 
   auto latencyEvaluator = ExprLatencyEvaluator();
+  int watchdog = 20;
   while (!worklist.empty()) {
     Operation* op = worklist.front();
     LLVM_DEBUG(llvm::dbgs()
                << "Processing " << op->getName().getStringRef().str() << "\n");
     worklist.pop_front();
-    bool latencyFound = latencyEvaluator.dispatchExprVisitor(op, valuesLatency);
+    bool latencyFound = latencyEvaluator.dispatchExprVisitor(op);
 
     if (latencyFound) {
-      auto it = valuesLatency.find(op->getOpResult(0));
+      auto it = latencyEvaluator.valuesLatency.find(op->getOpResult(0));
       LLVM_DEBUG(llvm::dbgs()
                 << "Found latency " << it->second << " for op " << op->getName().getStringRef().str() << "\n");
 
     } else {
       worklist.push_back(op);
     }
+
+    if (watchdog-- < 0) break;
+
+  }
+  for (auto it : latencyEvaluator.valuesLatency) {
+    LLVM_DEBUG(llvm::dbgs()
+               << "latency is " << it.second << "\n");
 
   }
 
