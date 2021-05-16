@@ -36,18 +36,24 @@ namespace {
 // node in a TimingPath
 class TimingPathNode {
   public:
+    /// local node latency
     double nodeLatency;
-    Value nodeValue;
+    Operation* nodeOp;
+    /// pointer to previous node (upstream) in the critical path
     TimingPathNode* previousNode;
+    /// pointer to the next node (downstream) in the critical path
     TimingPathNode* nextNode;
+    /// latency of the critical path ending at this node (including
+    //  this node local latency)
     double pathLatency;
 
-    TimingPathNode(): nodeLatency(0.0), nodeValue(nullptr), previousNode(nullptr),
+    TimingPathNode(): nodeLatency(0.0), nodeOp(nullptr), previousNode(nullptr),
                       nextNode(nullptr), pathLatency(0.0) {}
 
-    TimingPathNode(double latency, Value value, TimingPathNode* previous):
-      nodeLatency(latency), nodeValue(value), previousNode(previous), nextNode(nullptr) {
-        nodeValue.dump();
+    TimingPathNode(double latency, Operation* op, TimingPathNode* previous):
+      nodeLatency(latency), previousNode(previous), nextNode(nullptr) {
+        llvm::outs() << "registering node " << op << "\n";
+        nodeOp = op;
         pathLatency = (previous ? previousNode->pathLatency : 0.0) + nodeLatency;
         if (previous) previous->nextNode = this;
       }
@@ -139,7 +145,7 @@ void CriticalPathAnalysisPass::runOnOperation() {
   struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
   public:
     // llvm::DenseMap<Operation, double> opsLatency;
-    llvm::DenseMap<Value, TimingPathNode> valuesLatency;
+    llvm::DenseMap<Value, TimingPathNode*> valuesLatency;
 
     using FIRRTLVisitor<ExprLatencyEvaluator, bool>::visitExpr;
     using FIRRTLVisitor<ExprLatencyEvaluator, bool>::visitStmt;
@@ -149,7 +155,7 @@ void CriticalPathAnalysisPass::runOnOperation() {
     bool visitUnhandledExpr(Operation *op) { return false; }
     // constant operation have zero-latency
     bool visitExpr(ConstantOp op) {
-      valuesLatency[op->getOpResult(0)] = TimingPathNode(0.0, op->getOpResult(0), nullptr);
+      valuesLatency[op->getOpResult(0)] = new TimingPathNode(0.0, op, nullptr);
       return true;
      }
 
@@ -169,12 +175,12 @@ void CriticalPathAnalysisPass::runOnOperation() {
         //}
       } else {
         auto it = valuesLatency.find(input);
-        if (it == valuesLatency.end() || it->second.pathLatency < 0) return false;
-        previous = &(it->second);
+        if (it == valuesLatency.end() || it->second->pathLatency < 0) return false;
+        previous = (it->second);
       }
-      TimingPathNode pathNode = TimingPathNode(0.0, op->getOpResult(0), previous);
+      TimingPathNode* pathNode = new TimingPathNode(0.0, op, previous);
       LLVM_DEBUG(llvm::dbgs()
-                << "Inner Found latency " << pathNode.pathLatency << " for op " << op->getName().getStringRef().str() << "\n");
+                << "Inner Found latency " << pathNode->pathLatency << " for op " << op->getName().getStringRef().str() << "\n");
       valuesLatency[op->getOpResult(0)] = pathNode;
       return true;
     }
@@ -184,13 +190,13 @@ void CriticalPathAnalysisPass::runOnOperation() {
       TimingPathNode* longestPath = nullptr;
       for (auto operand: op->getOperands()) {
         auto it = valuesLatency.find(operand);
-        if (it == valuesLatency.end() || it->second.pathLatency < 0) return false;
-        double operandLatency = it->second.pathLatency;
+        if (it == valuesLatency.end() || it->second->pathLatency < 0) return false;
+        double operandLatency = it->second->pathLatency;
         if (nullptr == longestPath || operandLatency > longestPath->pathLatency)
-          longestPath = &(it->second);
+          longestPath = (it->second);
       }
       op->getOpResult(0).dump();
-      valuesLatency[op->getOpResult(0)] = TimingPathNode(opClassLatency, op->getOpResult(0), longestPath);
+      valuesLatency[op->getOpResult(0)] = new TimingPathNode(opClassLatency, op, longestPath);
       return true;
 
     }
@@ -208,8 +214,8 @@ void CriticalPathAnalysisPass::runOnOperation() {
     LLVM_DEBUG(llvm::dbgs()
                << "Processing connect\n");
       op.src().dump();
-      if (it == valuesLatency.end() || it->second.pathLatency < 0) return false;
-      valuesLatency[op.dest()] = TimingPathNode(0.0, op.dest(), &(it->second));
+      if (it == valuesLatency.end() || it->second->pathLatency < 0) return false;
+      valuesLatency[op.dest()] = new TimingPathNode(0.0, op.dest().getDefiningOp(), (it->second));
       return true;
     }
   };
@@ -238,10 +244,10 @@ void CriticalPathAnalysisPass::runOnOperation() {
                   << "invalid latency for op " << op->getName().getStringRef().str() << "\n");
 
       } else {
-        if (nullptr == criticalPathEnd || criticalPathEnd->pathLatency < it->second.pathLatency)
-        criticalPathEnd = &(it->second);
+        if (nullptr == criticalPathEnd || criticalPathEnd->pathLatency < it->second->pathLatency)
+        criticalPathEnd = (it->second);
         LLVM_DEBUG(llvm::dbgs()
-                  << "Found latency " << it->second.pathLatency << " for op " << op->getName().getStringRef().str() << "\n");
+                  << "Found latency " << it->second->pathLatency << " for op " << op->getName().getStringRef().str() << "\n");
       }
 
     } else {
@@ -253,7 +259,7 @@ void CriticalPathAnalysisPass::runOnOperation() {
   }
   for (auto it : latencyEvaluator.valuesLatency) {
     LLVM_DEBUG(llvm::dbgs()
-               << "latency is " << it.second.pathLatency << "\n");
+               << "latency is " << it.second->pathLatency << "\n");
 
   }
 
@@ -262,21 +268,27 @@ void CriticalPathAnalysisPass::runOnOperation() {
   // start by looking for path start
   TimingPathNode* criticalPathStart = criticalPathEnd;
   llvm::outs() << "Rewiding critical path:\n";
-  while (criticalPathStart != nullptr) {
-    llvm::outs() << "  Found new node.\n";
+  while (criticalPathStart != nullptr && criticalPathStart->previousNode != nullptr) {
+    llvm::outs() << "  Found new node." << criticalPathStart << " " << criticalPathStart->nodeOp << "\n";
     criticalPathStart = criticalPathStart->previousNode;
   }
   llvm::outs() << "critical path is:\n";
-  criticalPathEnd->nodeValue.dump();
-  criticalPathStart->nodeValue.dump();
+  //criticalPathEnd->nodeOp->getOpResult(0).dump();
+  //criticalPathStart->nodeOp->getOpResult(0).dump();
   for (int index = 0; ; index++) {
     if (criticalPathStart == nullptr) break;
     llvm::outs() << "#" << index << ": ";
-    // criticalPathStart->nodeValue.dump(); //print(llvm::outs());
+    criticalPathStart->nodeOp->getOpResult(0).print(llvm::outs());
     llvm::outs() << "\n";
+    // << criticalPathStart->nodeOp->getName().getStringRef().str() << "\n";
     criticalPathStart = criticalPathStart->nextNode;
   }
 
+  LLVM_DEBUG(llvm::dbgs() << "cleaning memory.\n");
+
+  for (auto it : latencyEvaluator.valuesLatency) {
+    delete it.second;
+  }
 
   // todo: keep ?
   markAllAnalysesPreserved();
