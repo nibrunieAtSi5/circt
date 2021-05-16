@@ -20,10 +20,11 @@
 #include "circt/Dialect/FIRRTL/Passes.h"
 #include "llvm/Support/Debug.h"
 
-// todo: to be removed
-#include <iostream>
+#include <iomanip>
+#include <sstream>
 
 #include <list>
+#include <cmath>
 
 #define DEBUG_TYPE "firrtl-critical-path"
 
@@ -39,6 +40,8 @@ class TimingPathNode {
     /// local node latency
     double nodeLatency;
     Operation* nodeOp;
+    // index of Value/OpResult in nodeOp corresponding to local value
+    int resultIndex;
     /// pointer to previous node (upstream) in the critical path
     TimingPathNode* previousNode;
     /// pointer to the next node (downstream) in the critical path
@@ -47,16 +50,45 @@ class TimingPathNode {
     //  this node local latency)
     double pathLatency;
 
-    TimingPathNode(): nodeLatency(0.0), nodeOp(nullptr), previousNode(nullptr),
+    TimingPathNode(): nodeLatency(0.0), nodeOp(nullptr), resultIndex(-1), previousNode(nullptr),
                       nextNode(nullptr), pathLatency(0.0) {}
 
-    TimingPathNode(double latency, Operation* op, TimingPathNode* previous):
-      nodeLatency(latency), previousNode(previous), nextNode(nullptr) {
-        llvm::outs() << "registering node " << op << "\n";
+    TimingPathNode(double latency, Operation* op, TimingPathNode* previous, int index=0):
+      nodeLatency(latency), resultIndex(index), previousNode(previous), nextNode(nullptr) {
         nodeOp = op;
         pathLatency = (previous ? previousNode->pathLatency : 0.0) + nodeLatency;
         if (previous) previous->nextNode = this;
       }
+};
+
+
+std::string doubleToString(double value, int prec=3) {
+  std::ostringstream streamObj;
+  streamObj << std::fixed << std::setprecision(prec) << value;
+  return streamObj.str();
+}
+
+int getWidth(Type type) {
+  return TypeSwitch<Type, int>(type)
+    .template Case<IntType>([&](auto type) {
+        return type.getWidth();
+     })
+    .Default([&](auto type) -> int { return -1;});
+}
+
+class TimingModel {
+  public:
+    static double getOpLatency(Operation* op) {
+      return TypeSwitch<Operation*, double>(op)
+            .template Case<XorPrimOp>([&](auto op) -> double { return 1.2;})
+            .template Case<OrPrimOp, AndPrimOp>([&](auto op) -> double{ return 1.0;})
+            .template Case<NotPrimOp>([&](auto op) -> double{ return 1.0;})
+
+            .template Case<XorRPrimOp>([&](auto op) -> double { return std::ceil(std::log2(getWidth(op.input().getType()))) * 1.2;})
+            .template Case<AndRPrimOp, OrRPrimOp>([&](auto op) -> double { return std::ceil(std::log2(getWidth(op.input().getType()))) * 1.0;})
+            .Default([&](auto op) -> double { return -1.0; });
+      }
+
 };
 
 bool isFlippedType(FIRRTLType type) {
@@ -104,8 +136,7 @@ void CriticalPathAnalysisPass::runOnOperation() {
   FModuleOp module = getOperation();
   anyFailed = false;
 
-  LLVM_DEBUG(llvm::dbgs()
-             << "executing CriticalPathAnalysisPass on " << module.getName().str() << ".\n");
+  llvm::outs() << "executing CriticalPathAnalysisPass on " << module.getName().str() << ".\n";
 
   // Check the port types. Unfortunately we don't have an exact location of the
   // port name, so we just point at the module with the port name mentioned in
@@ -151,7 +182,10 @@ void CriticalPathAnalysisPass::runOnOperation() {
     using FIRRTLVisitor<ExprLatencyEvaluator, bool>::visitStmt;
 
     // this callback ends the chain of visitInvalidExpr -> visitInvalidStmt -> visitInvalidDecl
-    bool visitInvalidDecl(Operation *op) { return false; }
+    bool visitInvalidDecl(Operation *op) {
+      llvm::errs() << "Unsupported operation: " << op->getName().getStringRef().str() << " \n";
+      return false;
+    }
     bool visitUnhandledExpr(Operation *op) { return false; }
     // constant operation have zero-latency
     bool visitExpr(ConstantOp op) {
@@ -195,25 +229,20 @@ void CriticalPathAnalysisPass::runOnOperation() {
         if (nullptr == longestPath || operandLatency > longestPath->pathLatency)
           longestPath = (it->second);
       }
-      op->getOpResult(0).dump();
       valuesLatency[op->getOpResult(0)] = new TimingPathNode(opClassLatency, op, longestPath);
       return true;
 
     }
 
-    bool visitExpr(XorPrimOp op) {
-      const double latency_xor = 2.0;
-      return visitMultiAryBitwiseOp(op, latency_xor);
-    }
-    bool visitExpr(AndPrimOp op) {
-      const double latency_and = 2.0;
-      return visitMultiAryBitwiseOp(op, latency_and);
-    }
+
+    bool visitExpr(XorPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
+    bool visitExpr(AndPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
+    bool visitExpr(OrPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
+
     bool visitStmt(ConnectOp op) {
       auto it = valuesLatency.find(op.src());
     LLVM_DEBUG(llvm::dbgs()
                << "Processing connect\n");
-      op.src().dump();
       if (it == valuesLatency.end() || it->second->pathLatency < 0) return false;
       valuesLatency[op.dest()] = new TimingPathNode(0.0, op.dest().getDefiningOp(), (it->second));
       return true;
@@ -272,13 +301,12 @@ void CriticalPathAnalysisPass::runOnOperation() {
     llvm::outs() << "  Found new node." << criticalPathStart << " " << criticalPathStart->nodeOp << "\n";
     criticalPathStart = criticalPathStart->previousNode;
   }
+
   llvm::outs() << "critical path is:\n";
-  //criticalPathEnd->nodeOp->getOpResult(0).dump();
-  //criticalPathStart->nodeOp->getOpResult(0).dump();
   for (int index = 0; ; index++) {
     if (criticalPathStart == nullptr) break;
-    llvm::outs() << "#" << index << ": ";
-    criticalPathStart->nodeOp->getOpResult(0).print(llvm::outs());
+    llvm::outs() << "#" << index << ": " << doubleToString(criticalPathStart->nodeLatency) << " " << doubleToString(criticalPathStart->pathLatency) << " ";
+    criticalPathStart->nodeOp->getOpResult(criticalPathStart->resultIndex).print(llvm::outs());
     llvm::outs() << "\n";
     // << criticalPathStart->nodeOp->getName().getStringRef().str() << "\n";
     criticalPathStart = criticalPathStart->nextNode;
