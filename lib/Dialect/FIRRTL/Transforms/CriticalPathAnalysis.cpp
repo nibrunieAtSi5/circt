@@ -1,4 +1,4 @@
-//===- CheckWidths.cpp - Check that width of types are known ----*- C++ -*-===//
+//===- CriticalPathAnalysis.cpp - Analyse FIRRTL module critical paths ----*- C++ -*-===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -6,10 +6,7 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This file defines the CheckWidths pass.
-//
-// Modeled after: <https://github.com/chipsalliance/firrtl/blob/master/src/main/
-// scala/firrtl/passes/CheckWidths.scala>
+// This file defines the CriticalPathAnalysis pass.
 //
 //===----------------------------------------------------------------------===//
 
@@ -62,12 +59,15 @@ class TimingPathNode {
 };
 
 
+/// Convert double precision value to string (used when injecting latency
+//  measurement into llvm::outs() )
 std::string doubleToString(double value, int prec=3) {
   std::ostringstream streamObj;
   streamObj << std::fixed << std::setprecision(prec) << value;
   return streamObj.str();
 }
 
+/// Extract a FIRRTL Type's width (if any else return -1)
 int getWidth(Type type) {
   return TypeSwitch<Type, int>(type)
     .template Case<IntType>([&](auto type) {
@@ -120,60 +120,7 @@ bool isInputField(FIRRTLType type, StringRef name) {
     return false;
 }
 
-
-/// A simple pass that emits errors for any occurrences of `uint`, `sint`, or
-/// `analog` without a known width.
-class CriticalPathAnalysisPass : public CriticalPathAnalysisBase<CriticalPathAnalysisPass> {
-  void runOnOperation() override;
-
-
-  /// Whether any checks have failed.
-  bool anyFailed;
-};
-} // namespace
-
-void CriticalPathAnalysisPass::runOnOperation() {
-  FModuleOp module = getOperation();
-  anyFailed = false;
-
-  llvm::outs() << "executing CriticalPathAnalysisPass on " << module.getName().str() << ".\n";
-
-  // Check the port types. Unfortunately we don't have an exact location of the
-  // port name, so we just point at the module with the port name mentioned in
-  // the error.
-  for (auto &port : module.getPorts()) {
-    LLVM_DEBUG(llvm::dbgs()
-               << "Port " << port.name << " of type " << port.type << "\n");
-  }
-
-  std::list<Operation*> worklist;
-
-  struct ExprInitialLatencyEvaluator : public FIRRTLVisitor<ExprInitialLatencyEvaluator, double> {
-    using FIRRTLVisitor<ExprInitialLatencyEvaluator, double>::visitExpr;
-
-    double visitInvalidExpr(Operation *op) { return -1.0; }
-    double visitUnhandledExpr(Operation *op) { return -1.0; }
-    // constant operation have zero-latency
-    double visitExpr(ConstantOp op) {return 0.0; }
-  };
-
-  auto initialEvaluator = ExprInitialLatencyEvaluator();
-
-
-  // Check the results of each operation.
-  module->walk([&](Operation *op) {
-    LLVM_DEBUG(llvm::dbgs()
-               << "Found op  " << op->getName().getStringRef().str() << "\n");
-    double latency = initialEvaluator.dispatchExprVisitor(op);
-    LLVM_DEBUG(llvm::dbgs()
-               << "latency for op  " << op->getName().getStringRef().str() << " has been evaluated to " << latency << "\n");
-    // opsLatency[op] = latency;
-    // valuesLatency[op->getOpResult(0)] = latency;
-    // enqueue operations for which latency was not determined
-    if (latency < 0)
-      worklist.push_back(op);
-  });
-  struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
+struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
   public:
     // llvm::DenseMap<Operation, double> opsLatency;
     llvm::DenseMap<Value, TimingPathNode*> valuesLatency;
@@ -247,11 +194,63 @@ void CriticalPathAnalysisPass::runOnOperation() {
       valuesLatency[op.dest()] = new TimingPathNode(0.0, op.dest().getDefiningOp(), (it->second));
       return true;
     }
-  };
+};
+
+/// A simple pass that emits errors for any occurrences of `uint`, `sint`, or
+/// `analog` without a known width.
+class CriticalPathAnalysisPass : public CriticalPathAnalysisBase<CriticalPathAnalysisPass> {
+  void runOnOperation() override;
+
+};
+} // namespace
+
+void CriticalPathAnalysisPass::runOnOperation() {
+  FModuleOp module = getOperation();
+
+  llvm::outs() << "executing CriticalPathAnalysisPass on " << module.getName().str() << ".\n";
+
+  // Check the port types. Unfortunately we don't have an exact location of the
+  // port name, so we just point at the module with the port name mentioned in
+  // the error.
+  for (auto &port : module.getPorts()) {
+    LLVM_DEBUG(llvm::dbgs()
+               << "Port " << port.name << " of type " << port.type << "\n");
+  }
 
   auto latencyEvaluator = ExprLatencyEvaluator();
+
+  // list of Operation node awaiting processing
+  std::list<Operation*> worklist;
+
+  // temporary determined critical path end node
   TimingPathNode* criticalPathEnd = nullptr;
-  // int watchdog = 20;
+
+  // Check the results of each operation.
+  module->walk([&](Operation *op) {
+    LLVM_DEBUG(llvm::dbgs()
+               << "Found op  " << op->getName().getStringRef().str() << "\n");
+    if (auto mod = dyn_cast<FModuleOp>(op)) {
+      LLVM_DEBUG(llvm::dbgs()
+                << "Found to discard: " << op->getName().getStringRef().str() << "\n");
+      return;
+    }
+    bool latencyFound = latencyEvaluator.dispatchExprVisitor(op);
+    LLVM_DEBUG(llvm::dbgs()
+               << "latency for op  " << op->getName().getStringRef().str() << " has been evaluated.\n");
+    // enqueue operations for which latency was not determined
+    if (!latencyFound)
+      worklist.push_back(op);
+    else {
+      auto it = latencyEvaluator.valuesLatency.find(op->getOpResult(0));
+      if (it != latencyEvaluator.valuesLatency.end()) {
+        if (nullptr == criticalPathEnd || criticalPathEnd->pathLatency < it->second->pathLatency)
+        criticalPathEnd = (it->second);
+        LLVM_DEBUG(llvm::dbgs()
+                  << "Found latency " << it->second->pathLatency << " for op " << op->getName().getStringRef().str() << "\n");
+      }
+    }
+  });
+
   while (!worklist.empty()) {
     Operation* op = worklist.front();
     LLVM_DEBUG(llvm::dbgs()
@@ -271,25 +270,15 @@ void CriticalPathAnalysisPass::runOnOperation() {
       if (it == latencyEvaluator.valuesLatency.end()) {
         LLVM_DEBUG(llvm::dbgs()
                   << "invalid latency for op " << op->getName().getStringRef().str() << "\n");
-
       } else {
         if (nullptr == criticalPathEnd || criticalPathEnd->pathLatency < it->second->pathLatency)
         criticalPathEnd = (it->second);
         LLVM_DEBUG(llvm::dbgs()
                   << "Found latency " << it->second->pathLatency << " for op " << op->getName().getStringRef().str() << "\n");
       }
-
     } else {
       worklist.push_back(op);
     }
-
-    // if (watchdog-- < 0) break;
-
-  }
-  for (auto it : latencyEvaluator.valuesLatency) {
-    LLVM_DEBUG(llvm::dbgs()
-               << "latency is " << it.second->pathLatency << "\n");
-
   }
 
   // todo: need a more canonical part to display result info
@@ -298,10 +287,11 @@ void CriticalPathAnalysisPass::runOnOperation() {
   TimingPathNode* criticalPathStart = criticalPathEnd;
   llvm::outs() << "Rewiding critical path:\n";
   while (criticalPathStart != nullptr && criticalPathStart->previousNode != nullptr) {
-    llvm::outs() << "  Found new node." << criticalPathStart << " " << criticalPathStart->nodeOp << "\n";
+    LLVM_DEBUG(llvm::dbgs() << "  Found new node." << criticalPathStart << " " << criticalPathStart->nodeOp << "\n");
     criticalPathStart = criticalPathStart->previousNode;
   }
 
+  // result display
   llvm::outs() << "critical path is:\n";
   for (int index = 0; ; index++) {
     if (criticalPathStart == nullptr) break;
@@ -312,8 +302,8 @@ void CriticalPathAnalysisPass::runOnOperation() {
     criticalPathStart = criticalPathStart->nextNode;
   }
 
+  // cleaning memory
   LLVM_DEBUG(llvm::dbgs() << "cleaning memory.\n");
-
   for (auto it : latencyEvaluator.valuesLatency) {
     delete it.second;
   }
