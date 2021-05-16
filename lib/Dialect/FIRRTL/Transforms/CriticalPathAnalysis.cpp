@@ -99,7 +99,9 @@ bool isFlippedType(FIRRTLType type) {
 
 // check if field <name> in aggregate format <type> is an input or not
 bool isInputField(FIRRTLType type, StringRef name) {
+   LLVM_DEBUG(llvm::dbgs() << "isInputField " << type << " " << name << "\n");
   if (auto flip = type.dyn_cast<FlipType>()) {
+     LLVM_DEBUG(llvm::dbgs() << "Input field is flipped\n");
     return !isInputField(flip.getElementType(), name);
   }
   return TypeSwitch<FIRRTLType, bool>(type)
@@ -107,16 +109,19 @@ bool isInputField(FIRRTLType type, StringRef name) {
           // Otherwise, we have a bundle type.  Break it down.
           for (auto &elt : bundle.getElements()) {
             if (elt.name.getValue() == name) {
-              return isFlippedType(elt.type);
+              return !isFlippedType(elt.type);
             }
           }
+          LLVM_DEBUG(llvm::dbgs() << "Input field not found\n");
           // todo: field not found
           return false;
         })
         .Default([&](auto) {
+          LLVM_DEBUG(llvm::dbgs() << "Input field default case\n");
           return false;
         });
 
+    LLVM_DEBUG(llvm::dbgs() << "Input field not matched by TypeSwitch\n");
     return false;
 }
 
@@ -292,8 +297,6 @@ void CriticalPathAnalysisPass::runOnOperation() {
         LLVM_DEBUG(llvm::dbgs()
                   << "invalid latency for op " << op->getName().getStringRef().str() << "\n");
       } else {
-        if (nullptr == criticalPathEnd || criticalPathEnd->pathLatency < it->second->pathLatency)
-        criticalPathEnd = (it->second);
         LLVM_DEBUG(llvm::dbgs()
                   << "Found latency " << it->second->pathLatency << " for op " << op->getName().getStringRef().str() << "\n");
       }
@@ -305,23 +308,28 @@ void CriticalPathAnalysisPass::runOnOperation() {
   // todo: need a more canonical part to display result info
   // critical path traversal
   // start by looking for path start
-  TimingPathNode* criticalPathStart = criticalPathEnd;
-  llvm::outs() << "Rewiding critical path:\n";
-  while (criticalPathStart != nullptr && criticalPathStart->previousNode != nullptr) {
-    LLVM_DEBUG(llvm::dbgs() << "  Found new node." << criticalPathStart << " " << criticalPathStart->nodeOp << "\n");
-    criticalPathStart = criticalPathStart->previousNode;
+  llvm::outs() << "Rewiding critical paths:\n";
+  for (auto pathEnd : latencyEvaluator.outputPaths) {
+    std::list<TimingPathNode*> localPath;
+    TimingPathNode* criticalPathStart = pathEnd;
+    while (criticalPathStart != nullptr && criticalPathStart->previousNode != nullptr) {
+      LLVM_DEBUG(llvm::dbgs() << "  Found new node." << criticalPathStart << " " << criticalPathStart->nodeOp << "\n");
+     localPath.push_front(criticalPathStart);
+      criticalPathStart = criticalPathStart->previousNode;
+    }
+    if (criticalPathStart) localPath.push_front(criticalPathStart);
+    int index = 0;
+    llvm::outs() << "critical path is:\n";
+    for (auto node : localPath) {
+      // result display
+      llvm::outs() << "#" << index << ": " << doubleToString(node->nodeLatency) << " " << doubleToString(node->pathLatency) << " ";
+      node->nodeOp->getOpResult(node->resultIndex).print(llvm::outs());
+      llvm::outs() << "\n";
+
+      index++;
+    }
   }
 
-  // result display
-  llvm::outs() << "critical path is:\n";
-  for (int index = 0; ; index++) {
-    if (criticalPathStart == nullptr) break;
-    llvm::outs() << "#" << index << ": " << doubleToString(criticalPathStart->nodeLatency) << " " << doubleToString(criticalPathStart->pathLatency) << " ";
-    criticalPathStart->nodeOp->getOpResult(criticalPathStart->resultIndex).print(llvm::outs());
-    llvm::outs() << "\n";
-    // << criticalPathStart->nodeOp->getName().getStringRef().str() << "\n";
-    criticalPathStart = criticalPathStart->nextNode;
-  }
 
   // cleaning memory
   LLVM_DEBUG(llvm::dbgs() << "cleaning memory.\n");
