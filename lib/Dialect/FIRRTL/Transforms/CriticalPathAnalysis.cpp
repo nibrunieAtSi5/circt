@@ -102,7 +102,7 @@ bool isInputField(FIRRTLType type, StringRef name) {
   if (auto flip = type.dyn_cast<FlipType>()) {
     return !isInputField(flip.getElementType(), name);
   }
-  TypeSwitch<FIRRTLType>(type)
+  return TypeSwitch<FIRRTLType, bool>(type)
         .Case<BundleType>([&](auto bundle) {
           // Otherwise, we have a bundle type.  Break it down.
           for (auto &elt : bundle.getElements()) {
@@ -120,10 +120,27 @@ bool isInputField(FIRRTLType type, StringRef name) {
     return false;
 }
 
+bool isInputField(Type type, StringRef name) {
+    return isInputField(type.dyn_cast<FIRRTLType>(), name);
+}
+
+
+ bool isBlockArgument(Value val) {
+   return val.isa<BlockArgument>();
+ }
+
+bool isOutputValue(Value dest) {
+  return TypeSwitch<Operation*, bool>(dest.getDefiningOp())
+        .template Case<SubfieldOp>([&](auto op) -> bool {
+            return isBlockArgument(op.input()) && !isInputField(op.input().getType(), op.fieldname());
+         })
+        .Default([&](auto op) -> double { return false; });
+}
 struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
   public:
     // llvm::DenseMap<Operation, double> opsLatency;
     llvm::DenseMap<Value, TimingPathNode*> valuesLatency;
+    llvm::SmallVector<TimingPathNode*> outputPaths;
 
     using FIRRTLVisitor<ExprLatencyEvaluator, bool>::visitExpr;
     using FIRRTLVisitor<ExprLatencyEvaluator, bool>::visitStmt;
@@ -140,6 +157,8 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
       return true;
      }
 
+
+
     bool visitExpr(SubfieldOp op) {
       auto input = op.input();
       auto field = op.fieldname();
@@ -151,9 +170,7 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
         LLVM_DEBUG(llvm::dbgs()
                   << "SubField's input is a BlockArgument. " << input.getType() << " \n");
         bool isInput = isInputField(input.getType().dyn_cast<FIRRTLType>(), field);
-        //if (auto flipType = input.getType().dyn_cast<firrtl::FlipType>()) {
-          LLVM_DEBUG(llvm::dbgs() << "field type is flipped=" << isInput << "\n.");
-        //}
+        LLVM_DEBUG(llvm::dbgs() << "field type is flipped=" << isInput << "\n.");
       } else {
         auto it = valuesLatency.find(input);
         if (it == valuesLatency.end() || it->second->pathLatency < 0) return false;
@@ -191,7 +208,11 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
     LLVM_DEBUG(llvm::dbgs()
                << "Processing connect\n");
       if (it == valuesLatency.end() || it->second->pathLatency < 0) return false;
-      valuesLatency[op.dest()] = new TimingPathNode(0.0, op.dest().getDefiningOp(), (it->second));
+      TimingPathNode* localPath = new TimingPathNode(0.0, op.dest().getDefiningOp(), (it->second));
+      valuesLatency[op.dest()] = localPath;
+      if (isOutputValue(op.dest())) {
+        outputPaths.push_back(localPath);
+      }
       return true;
     }
 };
