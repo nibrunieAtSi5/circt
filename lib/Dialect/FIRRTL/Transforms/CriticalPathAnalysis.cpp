@@ -107,10 +107,11 @@ class TimingModel {
             .template Case<GTPrimOp, LTPrimOp>([&](auto op) -> double { return std::ceil(std::log2(getResultWidth(op))) * 2.2;})
             .template Case<GEQPrimOp, LEQPrimOp>([&](auto op) -> double { return std::ceil(std::log2(getResultWidth(op))) * 2.2 + 1.0;})
             .template Case<ShlPrimOp, ShrPrimOp>([&](auto op) -> double { return 0.0;})
-            .template Case<AsSIntPrimOp, AsUIntPrimOp, CvtPrimOp>([&](auto op) -> double { return 0.0;})
+            .template Case<AsSIntPrimOp, AsUIntPrimOp, AsPassivePrimOp, AsNonPassivePrimOp, CvtPrimOp>([&](auto op) -> double { return 0.0;})
             .template Case<CatPrimOp>([&](auto op) -> double { return 0.0;})
             .template Case<MuxPrimOp>([&](auto op) -> double { return 2.0;})
             .template Case<PadPrimOp>([&](auto op) -> double { return isSignExtended(op) ? std::ceil(std::log2(op.amount())) * 0.5 : 0.0;}) // log2 for sign fanout
+            .template Case<DShlPrimOp, DShrPrimOp>([&](auto op) -> double { return std::ceil(std::log2(getWidth(op.rhs().getType()))) * 2.0;})
             .Default([&](auto op) -> double { return -1.0; });
       }
 
@@ -181,6 +182,26 @@ bool isInputField(Type type, StringRef name) {
     .Default([](auto) { return Value();});
  }
 
+ bool isRegister(Value val) {
+  if (!val) return false;
+  Operation* op = val.getDefiningOp();
+  if (!op)
+    return false;
+  return TypeSwitch<Operation *, bool>(op)
+    .Case<SubfieldOp>([](auto op) { return isRegister(op.input());})
+    .Case<RegOp, RegResetOp>([](auto) { return true;})
+    .Default([](auto) { return false;});
+ }
+
+ Value getRegisterValue(Value val) {
+  Operation* op = val.getDefiningOp();
+  return TypeSwitch<Operation *, Value>(op)
+    .Case<SubfieldOp>([](auto op) { return getRegisterValue(op.input());})
+    .Case<RegOp, RegResetOp>([&](auto) { return val;})
+    .Default([](auto) { return Value();});
+ }
+
+
 bool isOutputValue(Value dest) {
   if (!dest) return false;
   Operation *op = dest.getDefiningOp();
@@ -191,11 +212,37 @@ bool isOutputValue(Value dest) {
          })
         .Default([&](auto op) -> double { return false; });
 }
+
+
+void postProcessPaths(llvm::SmallVector<TimingPathNode*>& pathVectors) {
+  for (auto pathEnd : pathVectors) {
+    std::list<TimingPathNode*> localPath;
+    TimingPathNode* criticalPathStart = pathEnd;
+    while (criticalPathStart != nullptr && criticalPathStart->previousNode != nullptr) {
+      LLVM_DEBUG(llvm::dbgs() << "  Found new node." << criticalPathStart << " " << criticalPathStart->nodeOp << "\n");
+    localPath.push_front(criticalPathStart);
+      criticalPathStart = criticalPathStart->previousNode;
+    }
+    if (criticalPathStart) localPath.push_front(criticalPathStart);
+    int index = 0;
+    llvm::outs() << "critical path is:\n";
+    for (auto node : localPath) {
+      // result display
+      llvm::outs() << "#" << index << ": " << doubleToString(node->nodeLatency) << " " << doubleToString(node->pathLatency) << " ";
+      node->nodeOp->getOpResult(node->resultIndex).print(llvm::outs());
+      llvm::outs() << "\n";
+
+      index++;
+    }
+  }
+}
+
 struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
   public:
     // llvm::DenseMap<Operation, double> opsLatency;
     llvm::DenseMap<Value, TimingPathNode*> valuesLatency;
     llvm::SmallVector<TimingPathNode*> outputPaths;
+    llvm::SmallVector<TimingPathNode*> registerPaths;
 
     using FIRRTLVisitor<ExprLatencyEvaluator, bool>::visitExpr;
     using FIRRTLVisitor<ExprLatencyEvaluator, bool>::visitStmt;
@@ -208,6 +255,14 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
     }
     bool visitUnhandledExpr(Operation *op) {
       llvm::errs() << "Unsupported expression: " << op->getName().getStringRef().str() << " \n";
+      return false;
+    }
+    bool visitUnhandledStmt(Operation *op) {
+      llvm::errs() << "Unsupported statement: " << op->getName().getStringRef().str() << " \n";
+      return false;
+    }
+    bool visitUnhandledDecl(Operation *op) {
+      llvm::errs() << "Unsupported declaration: " << op->getName().getStringRef().str() << " \n";
       return false;
     }
 
@@ -273,6 +328,9 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
     bool visitExpr(ShrPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
     bool visitExpr(ShlPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
 
+    bool visitExpr(DShrPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
+    bool visitExpr(DShlPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
+
     bool visitExpr(EQPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
     bool visitExpr(NEQPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
 
@@ -284,6 +342,8 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
     bool visitExpr(CvtPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
     bool visitExpr(AsSIntPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
     bool visitExpr(AsUIntPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
+    bool visitExpr(AsPassivePrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
+    bool visitExpr(AsNonPassivePrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
 
     bool visitExpr(PadPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
 
@@ -320,11 +380,18 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
       valuesLatency[destOp] = localPath;
       if (isOutputValue(destOp)) {
         outputPaths.push_back(localPath);
+      } else if (isRegister(destOp)) {
+        registerPaths.push_back(localPath);
       }
       return true;
     }
 
     bool visitDecl(WireOp op){
+      return true;
+    }
+
+    bool visitDecl(RegOp op){
+      valuesLatency[op.result()] = new TimingPathNode(0.0, op, nullptr);
       return true;
     }
 };
@@ -416,26 +483,9 @@ void CriticalPathAnalysisPass::runOnOperation() {
   // critical path traversal
   // start by looking for path start
   llvm::outs() << "Rewiding critical paths:\n";
-  for (auto pathEnd : latencyEvaluator.outputPaths) {
-    std::list<TimingPathNode*> localPath;
-    TimingPathNode* criticalPathStart = pathEnd;
-    while (criticalPathStart != nullptr && criticalPathStart->previousNode != nullptr) {
-      LLVM_DEBUG(llvm::dbgs() << "  Found new node." << criticalPathStart << " " << criticalPathStart->nodeOp << "\n");
-     localPath.push_front(criticalPathStart);
-      criticalPathStart = criticalPathStart->previousNode;
-    }
-    if (criticalPathStart) localPath.push_front(criticalPathStart);
-    int index = 0;
-    llvm::outs() << "critical path is:\n";
-    for (auto node : localPath) {
-      // result display
-      llvm::outs() << "#" << index << ": " << doubleToString(node->nodeLatency) << " " << doubleToString(node->pathLatency) << " ";
-      node->nodeOp->getOpResult(node->resultIndex).print(llvm::outs());
-      llvm::outs() << "\n";
 
-      index++;
-    }
-  }
+  postProcessPaths(latencyEvaluator.outputPaths);
+  postProcessPaths(latencyEvaluator.registerPaths);
 
 
   // cleaning memory
