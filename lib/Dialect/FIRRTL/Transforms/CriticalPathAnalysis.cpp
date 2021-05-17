@@ -84,6 +84,13 @@ int getResultWidth(Operation *op) {
   return getWidth(op->getOpResult(0).getType());
 }
 
+bool isSignExtended(Operation* op) {
+  auto type = op->getOpResult(0).getType();
+  // todo: could check input type
+  return type.cast<IntType>().isSigned();
+
+}
+
 class TimingModel {
   public:
     static double getOpLatency(Operation* op) {
@@ -100,7 +107,10 @@ class TimingModel {
             .template Case<GTPrimOp, LTPrimOp>([&](auto op) -> double { return std::ceil(std::log2(getResultWidth(op))) * 2.2;})
             .template Case<GEQPrimOp, LEQPrimOp>([&](auto op) -> double { return std::ceil(std::log2(getResultWidth(op))) * 2.2 + 1.0;})
             .template Case<ShlPrimOp, ShrPrimOp>([&](auto op) -> double { return 0.0;})
-            .template Case<AsSIntPrimOp, CvtPrimOp>([&](auto op) -> double { return 0.0;})
+            .template Case<AsSIntPrimOp, AsUIntPrimOp, CvtPrimOp>([&](auto op) -> double { return 0.0;})
+            .template Case<CatPrimOp>([&](auto op) -> double { return 0.0;})
+            .template Case<MuxPrimOp>([&](auto op) -> double { return 2.0;})
+            .template Case<PadPrimOp>([&](auto op) -> double { return isSignExtended(op) ? std::ceil(std::log2(op.amount())) * 0.5 : 0.0;}) // log2 for sign fanout
             .Default([&](auto op) -> double { return -1.0; });
       }
 
@@ -152,6 +162,7 @@ bool isInputField(Type type, StringRef name) {
 /// Test recursively if the given <val>
 // is a wire or a sub-wire (SubfieldOp ...)
  bool isWire(Value val) {
+  if (!val) return false;
   Operation* op = val.getDefiningOp();
   if (!op)
     return false;
@@ -171,7 +182,10 @@ bool isInputField(Type type, StringRef name) {
  }
 
 bool isOutputValue(Value dest) {
-  return TypeSwitch<Operation*, bool>(dest.getDefiningOp())
+  if (!dest) return false;
+  Operation *op = dest.getDefiningOp();
+  if (!op) return false;
+  return TypeSwitch<Operation*, bool>(op)
         .template Case<SubfieldOp>([&](auto op) -> bool {
             return isBlockArgument(op.input()) && !isInputField(op.input().getType(), op.fieldname());
          })
@@ -269,6 +283,12 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
 
     bool visitExpr(CvtPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
     bool visitExpr(AsSIntPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
+    bool visitExpr(AsUIntPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
+
+    bool visitExpr(PadPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
+
+    bool visitExpr(CatPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
+    bool visitExpr(MuxPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
 
     bool visitExpr(BitsPrimOp op) {
       auto it = valuesLatency.find(op.input());
