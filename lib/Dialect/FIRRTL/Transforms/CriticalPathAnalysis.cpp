@@ -36,13 +36,13 @@ class TimingPathNode {
   public:
     /// local node latency
     double nodeLatency;
-    Operation* nodeOp;
+    Operation *nodeOp;
     // index of Value/OpResult in nodeOp corresponding to local value
     int resultIndex;
     /// pointer to previous node (upstream) in the critical path
-    TimingPathNode* previousNode;
+    TimingPathNode *previousNode;
     /// pointer to the next node (downstream) in the critical path
-    TimingPathNode* nextNode;
+    TimingPathNode *nextNode;
     /// latency of the critical path ending at this node (including
     //  this node local latency)
     double pathLatency;
@@ -76,6 +76,14 @@ int getWidth(Type type) {
     .Default([&](auto type) -> int { return -1;});
 }
 
+int getMinWidthBinaryOp(Operation *op) {
+  return std::min(getWidth(op->getOperand(0).getType()), getWidth(op->getOperand(1).getType()));
+}
+
+int getResultWidth(Operation *op) {
+  return getWidth(op->getOpResult(0).getType());
+}
+
 class TimingModel {
   public:
     static double getOpLatency(Operation* op) {
@@ -86,6 +94,13 @@ class TimingModel {
 
             .template Case<XorRPrimOp>([&](auto op) -> double { return std::ceil(std::log2(getWidth(op.input().getType()))) * 1.2;})
             .template Case<AndRPrimOp, OrRPrimOp>([&](auto op) -> double { return std::ceil(std::log2(getWidth(op.input().getType()))) * 1.0;})
+            // should distinguish between operation with one operand constant and operand between two dynamic operands
+            .template Case<EQPrimOp, NEQPrimOp>([&](auto op) -> double { return 1.2 + std::ceil(std::log2(getMinWidthBinaryOp(op))) * 1.0;})
+            .template Case<AddPrimOp, SubPrimOp>([&](auto op) -> double { return std::ceil(std::log2(getResultWidth(op))) * 2.2;})
+            .template Case<GTPrimOp, LTPrimOp>([&](auto op) -> double { return std::ceil(std::log2(getResultWidth(op))) * 2.2;})
+            .template Case<GEQPrimOp, LEQPrimOp>([&](auto op) -> double { return std::ceil(std::log2(getResultWidth(op))) * 2.2 + 1.0;})
+            .template Case<ShlPrimOp, ShrPrimOp>([&](auto op) -> double { return 0.0;})
+            .template Case<AsSIntPrimOp, CvtPrimOp>([&](auto op) -> double { return 0.0;})
             .Default([&](auto op) -> double { return -1.0; });
       }
 
@@ -134,6 +149,27 @@ bool isInputField(Type type, StringRef name) {
    return val.isa<BlockArgument>();
  }
 
+/// Test recursively if the given <val>
+// is a wire or a sub-wire (SubfieldOp ...)
+ bool isWire(Value val) {
+  Operation* op = val.getDefiningOp();
+  if (!op)
+    return false;
+  return TypeSwitch<Operation *, bool>(op)
+    .Case<SubfieldOp>([](auto op) { return isWire(op.input());})
+    .Case<WireOp>([](auto) { return true;})
+    .Default([](auto) { return false;});
+ }
+
+/// Extract the main WireOp Value from a wire or a sub-wire (SubfieldOp ...)
+ Value getWireValue(Value val) {
+  Operation* op = val.getDefiningOp();
+  return TypeSwitch<Operation *, Value>(op)
+    .Case<SubfieldOp>([](auto op) { return getWireValue(op.input());})
+    .Case<WireOp>([&](auto) { return val;})
+    .Default([](auto) { return Value();});
+ }
+
 bool isOutputValue(Value dest) {
   return TypeSwitch<Operation*, bool>(dest.getDefiningOp())
         .template Case<SubfieldOp>([&](auto op) -> bool {
@@ -149,20 +185,23 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
 
     using FIRRTLVisitor<ExprLatencyEvaluator, bool>::visitExpr;
     using FIRRTLVisitor<ExprLatencyEvaluator, bool>::visitStmt;
+    using FIRRTLVisitor<ExprLatencyEvaluator, bool>::visitDecl;
 
     // this callback ends the chain of visitInvalidExpr -> visitInvalidStmt -> visitInvalidDecl
     bool visitInvalidDecl(Operation *op) {
       llvm::errs() << "Unsupported operation: " << op->getName().getStringRef().str() << " \n";
       return false;
     }
-    bool visitUnhandledExpr(Operation *op) { return false; }
+    bool visitUnhandledExpr(Operation *op) {
+      llvm::errs() << "Unsupported expression: " << op->getName().getStringRef().str() << " \n";
+      return false;
+    }
+
     // constant operation have zero-latency
     bool visitExpr(ConstantOp op) {
       valuesLatency[op->getOpResult(0)] = new TimingPathNode(0.0, op, nullptr);
       return true;
      }
-
-
 
     bool visitExpr(SubfieldOp op) {
       auto input = op.input();
@@ -208,16 +247,64 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
     bool visitExpr(AndPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
     bool visitExpr(OrPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
 
-    bool visitStmt(ConnectOp op) {
-      auto it = valuesLatency.find(op.src());
-    LLVM_DEBUG(llvm::dbgs()
-               << "Processing connect\n");
+    bool visitExpr(AndRPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
+    bool visitExpr(OrRPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
+    bool visitExpr(XorRPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
+
+    bool visitExpr(NotPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
+
+    bool visitExpr(AddPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
+    bool visitExpr(SubPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
+
+    bool visitExpr(ShrPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
+    bool visitExpr(ShlPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
+
+    bool visitExpr(EQPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
+    bool visitExpr(NEQPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
+
+    bool visitExpr(LTPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
+    bool visitExpr(LEQPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
+    bool visitExpr(GTPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
+    bool visitExpr(GEQPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
+
+    bool visitExpr(CvtPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
+    bool visitExpr(AsSIntPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
+
+    bool visitExpr(BitsPrimOp op) {
+      auto it = valuesLatency.find(op.input());
+
+      // todo: for now we discard the selection range
       if (it == valuesLatency.end() || it->second->pathLatency < 0) return false;
-      TimingPathNode* localPath = new TimingPathNode(0.0, op.dest().getDefiningOp(), (it->second));
-      valuesLatency[op.dest()] = localPath;
-      if (isOutputValue(op.dest())) {
+      TimingPathNode* localPath = new TimingPathNode(0.0, op, (it->second));
+      valuesLatency[op->getOpResult(0)] = localPath;
+      return true;
+    }
+
+    bool visitStmt(ConnectOp op) {
+      Value srcOp;
+      if (isWire(op.src())) srcOp = getWireValue(op.src());
+      else srcOp = op.src();
+      auto it = valuesLatency.find(srcOp);
+      LLVM_DEBUG(llvm::dbgs()
+                << "Processing connect\n");
+      if (it == valuesLatency.end() || it->second->pathLatency < 0) return false;
+      Value destOp;
+      if (isWire(op.dest())) {
+        // we squeeze wire as a single Value
+        // todo: optimize by field
+        destOp = getWireValue(op.dest());
+      } else {
+        destOp = op.dest();
+      }
+      TimingPathNode* localPath = new TimingPathNode(0.0, destOp.getDefiningOp(), (it->second));
+      valuesLatency[destOp] = localPath;
+      if (isOutputValue(destOp)) {
         outputPaths.push_back(localPath);
       }
+      return true;
+    }
+
+    bool visitDecl(WireOp op){
       return true;
     }
 };
@@ -277,7 +364,7 @@ void CriticalPathAnalysisPass::runOnOperation() {
     }
   });
 
-  while (!worklist.empty()) {
+  while (false && !worklist.empty()) {
     Operation* op = worklist.front();
     LLVM_DEBUG(llvm::dbgs()
                << "Processing " << op->getName().getStringRef().str() << "\n");
