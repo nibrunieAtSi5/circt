@@ -59,18 +59,19 @@ class TimingPathNode {
 };
 
 // return true if <val> is one of its block's argument
-bool isBlockArgument(Value val) {
-   return val.isa<BlockArgument>();
- }
+bool isBlockArgument(Value val) { return val.isa<BlockArgument>(); }
 
 class ModuleInfo {
 public:
+  // local module
   FModuleOp module;
+  // determine if <val> is an input port of <module>
   bool isInputPort(Value val) {
     if (!isBlockArgument(val)) return false;
     auto argIndex = val.cast<BlockArgument>().getArgNumber();
     return !getModulePortInfo(module)[argIndex].isOutput();
   }
+  // determine if <val> is an output port of <module>
   bool isOutputPort(Value val) {
     if (!isBlockArgument(val)) return false;
     auto argIndex = val.cast<BlockArgument>().getArgNumber();
@@ -97,14 +98,18 @@ int getWidth(Type type) {
     .Default([&](auto type) -> int { return -1;});
 }
 
+// get the minimal width of the operands of a 2-input operations
 int getMinWidthBinaryOp(Operation *op) {
   return std::min(getWidth(op->getOperand(0).getType()), getWidth(op->getOperand(1).getType()));
 }
 
+// get the width of the first result of <op>
 int getResultWidth(Operation *op) {
   return getWidth(op->getOpResult(0).getType());
 }
 
+// is the type of the first result of <op> a signed integer type
+// (assuming it is an integer type)
 bool isSignExtended(Operation* op) {
   auto type = op->getOpResult(0).getType();
   // todo: could check input type
@@ -218,6 +223,7 @@ bool isInputField(Type type, StringRef name) {
     .Default([](auto) { return Value();});
  }
 
+// test if <val> is a Register operation (directly or recursively)
  bool isRegister(Value val) {
   if (!val) return false;
   Operation* op = val.getDefiningOp();
@@ -229,6 +235,7 @@ bool isInputField(Type type, StringRef name) {
     .Default([](auto) { return false;});
  }
 
+// extract the RegOp associated to val
  Value getRegisterValue(Value val) {
   Operation* op = val.getDefiningOp();
   return TypeSwitch<Operation *, Value>(op)
