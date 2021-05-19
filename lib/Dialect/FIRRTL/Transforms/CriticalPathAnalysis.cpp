@@ -58,6 +58,27 @@ class TimingPathNode {
       }
 };
 
+// return true if <val> is one of its block's argument
+bool isBlockArgument(Value val) {
+   return val.isa<BlockArgument>();
+ }
+
+class ModuleInfo {
+public:
+  FModuleOp module;
+  bool isInputPort(Value val) {
+    if (!isBlockArgument(val)) return false;
+    auto argIndex = val.cast<BlockArgument>().getArgNumber();
+    return !getModulePortInfo(module)[argIndex].isOutput();
+  }
+  bool isOutputPort(Value val) {
+    if (!isBlockArgument(val)) return false;
+    auto argIndex = val.cast<BlockArgument>().getArgNumber();
+    return getModulePortInfo(module)[argIndex].isOutput();
+  }
+};
+
+
 
 /// Convert double precision value to string (used when injecting latency
 //  measurement into llvm::outs() )
@@ -91,6 +112,8 @@ bool isSignExtended(Operation* op) {
 
 }
 
+// dummy timing model
+// todo: translate logical-effort into proper evaluation rules
 class TimingModel {
   public:
     static double getOpLatency(Operation* op) {
@@ -121,6 +144,22 @@ bool isFlippedType(FIRRTLType type) {
   if (auto flip = type.dyn_cast<FlipType>())
     return true;
   return false;
+}
+
+bool isInputType(FIRRTLType type) {
+  return !isFlippedType(type);
+}
+
+bool isInputType(Type type) {
+  return isInputType(type.dyn_cast<FIRRTLType>());
+}
+
+bool isOutputType(FIRRTLType type) {
+  return isFlippedType(type);
+}
+
+bool isOutputType(Type type) {
+  return isOutputType(type.dyn_cast<FIRRTLType>());
 }
 
 // check if field <name> in aggregate format <type> is an input or not
@@ -156,9 +195,6 @@ bool isInputField(Type type, StringRef name) {
 }
 
 
- bool isBlockArgument(Value val) {
-   return val.isa<BlockArgument>();
- }
 
 /// Test recursively if the given <val>
 // is a wire or a sub-wire (SubfieldOp ...)
@@ -201,14 +237,35 @@ bool isInputField(Type type, StringRef name) {
     .Default([](auto) { return Value();});
  }
 
+bool isInputValue(ModuleInfo* moduleInfo, Value val) {
+  if (!val) return false;
+  if (isBlockArgument(val) && moduleInfo->isInputPort(val)) return true;
+  Operation *op = val.getDefiningOp();
+  if (!op) return false;
+  return TypeSwitch<Operation*, bool>(op)
+        .template Case<SubfieldOp>([&](auto op) -> bool {
+             return isInputValue(moduleInfo, op.input());
+            //return isBlockArgument(op.input()) && isInputField(moduleInfo, op.input().getType(), op.fieldname());
+         })
+        .Default([&](auto op) -> double { return false; });
+}
 
-bool isOutputValue(Value dest) {
+bool isOutputValue(ModuleInfo *moduleInfo, Value dest) {
   if (!dest) return false;
+  llvm::outs() << "testing is block argument ";
+  dest.print(llvm::outs());
+  llvm::outs() << "\n";
+  if (isBlockArgument(dest) && moduleInfo->isOutputPort(dest)) {
+    llvm::outs() << "   is output\n";
+    return true;
+  }
+  llvm::outs() << "   is not output\n";
   Operation *op = dest.getDefiningOp();
   if (!op) return false;
   return TypeSwitch<Operation*, bool>(op)
         .template Case<SubfieldOp>([&](auto op) -> bool {
-            return isBlockArgument(op.input()) && !isInputField(op.input().getType(), op.fieldname());
+            // return isBlockArgument(op.input()) && !isInputField(op.input().getType(), op.fieldname());
+            return isOutputValue(moduleInfo, op.input());
          })
         .Default([&](auto op) -> double { return false; });
 }
@@ -229,7 +286,7 @@ void postProcessPaths(llvm::SmallVector<TimingPathNode*>& pathVectors) {
     for (auto node : localPath) {
       // result display
       llvm::outs() << "#" << index << ": " << doubleToString(node->nodeLatency) << " " << doubleToString(node->pathLatency) << " ";
-      node->nodeOp->getOpResult(node->resultIndex).print(llvm::outs());
+      if (node && node->nodeOp) node->nodeOp->getOpResult(node->resultIndex).print(llvm::outs());
       llvm::outs() << "\n";
 
       index++;
@@ -242,7 +299,9 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
     // llvm::DenseMap<Operation, double> opsLatency;
     llvm::DenseMap<Value, TimingPathNode*> valuesLatency;
     llvm::SmallVector<TimingPathNode*> outputPaths;
-    llvm::SmallVector<TimingPathNode*> registerPaths;
+    llvm::SmallVector<TimingPathNode*> fromRegPaths;
+    llvm::SmallVector<TimingPathNode*> toRegPaths;
+    ModuleInfo* moduleInfo;
 
     using FIRRTLVisitor<ExprLatencyEvaluator, bool>::visitExpr;
     using FIRRTLVisitor<ExprLatencyEvaluator, bool>::visitStmt;
@@ -278,16 +337,12 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
       LLVM_DEBUG(llvm::dbgs()
                 << "SubField's fieldname is " << field << " \n");
       TimingPathNode* previous = nullptr;
-      if (input.isa<BlockArgument>()) {
+      if (isInputValue(moduleInfo, input)) {
 
-        LLVM_DEBUG(llvm::dbgs()
-                  << "SubField's input is a BlockArgument. " << input.getType() << " \n");
-        bool isInput = isInputField(input.getType().dyn_cast<FIRRTLType>(), field);
-        LLVM_DEBUG(llvm::dbgs() << "field type is flipped=" << isInput << "\n.");
       } else {
-        auto it = valuesLatency.find(input);
-        if (it == valuesLatency.end() || it->second->pathLatency < 0) return false;
-        previous = (it->second);
+        TimingPathNode* prePath = getStoredLatency(moduleInfo, input);
+        if (prePath) return false;
+        previous = prePath;
       }
       TimingPathNode* pathNode = new TimingPathNode(0.0, op, previous);
       LLVM_DEBUG(llvm::dbgs()
@@ -300,11 +355,11 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
     bool visitMultiAryBitwiseOp(Operation* op, const double opClassLatency) {
       TimingPathNode* longestPath = nullptr;
       for (auto operand: op->getOperands()) {
-        auto it = valuesLatency.find(operand);
-        if (it == valuesLatency.end() || it->second->pathLatency < 0) return false;
-        double operandLatency = it->second->pathLatency;
+        TimingPathNode* prePath = getStoredLatency(moduleInfo, operand);
+        if (!prePath) return false;
+        double operandLatency = prePath->pathLatency;
         if (nullptr == longestPath || operandLatency > longestPath->pathLatency)
-          longestPath = (it->second);
+          longestPath = prePath;
       }
       valuesLatency[op->getOpResult(0)] = new TimingPathNode(opClassLatency, op, longestPath);
       return true;
@@ -351,23 +406,37 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
     bool visitExpr(MuxPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
 
     bool visitExpr(BitsPrimOp op) {
-      auto it = valuesLatency.find(op.input());
-
-      // todo: for now we discard the selection range
-      if (it == valuesLatency.end() || it->second->pathLatency < 0) return false;
-      TimingPathNode* localPath = new TimingPathNode(0.0, op, (it->second));
+      TimingPathNode* prePath = getStoredLatency(moduleInfo, op.input());
+      // todo: for now we discard the effect of the selection range
+      if (!prePath) return false;
+      TimingPathNode* localPath = new TimingPathNode(0.0, op, prePath);
       valuesLatency[op->getOpResult(0)] = localPath;
       return true;
     }
 
+    // todo: should use Option-like mechanism to return both path and success flag rather (than inout arg)
+    TimingPathNode* getStoredLatency(ModuleInfo *moduleInfo, Value val) {
+      assert(moduleInfo);
+      auto it = valuesLatency.find(val);
+      if (it == valuesLatency.end() || it->second->pathLatency < 0) {
+        if (isInputValue(moduleInfo, val)) {
+            TimingPathNode* inputPath = new TimingPathNode(0.0, nullptr, nullptr);
+            valuesLatency[val] = inputPath;
+            return inputPath;
+        }
+        llvm::outs() << "could not find latency for Value " << val << " defined here: " << val.getDefiningOp() << "\n";
+        return nullptr;
+      }
+      return it->second;
+    }
+
     bool visitStmt(ConnectOp op) {
       Value srcOp;
+      (void) isOutputValue(moduleInfo, op.dest());
       if (isWire(op.src())) srcOp = getWireValue(op.src());
       else srcOp = op.src();
-      auto it = valuesLatency.find(srcOp);
-      LLVM_DEBUG(llvm::dbgs()
-                << "Processing connect\n");
-      if (it == valuesLatency.end() || it->second->pathLatency < 0) return false;
+      TimingPathNode* path = getStoredLatency(moduleInfo, srcOp);
+      if (!path) return false;
       Value destOp;
       if (isWire(op.dest())) {
         // we squeeze wire as a single Value
@@ -376,12 +445,18 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
       } else {
         destOp = op.dest();
       }
-      TimingPathNode* localPath = new TimingPathNode(0.0, destOp.getDefiningOp(), (it->second));
+      TimingPathNode* localPath = new TimingPathNode(0.0, destOp.getDefiningOp(), path);
       valuesLatency[destOp] = localPath;
-      if (isOutputValue(destOp)) {
+      if (isOutputValue(moduleInfo, destOp)) {
+        llvm::outs() << "found connection to output ";
+        destOp.print(llvm::outs());
+        llvm::outs() << ".\n";
         outputPaths.push_back(localPath);
       } else if (isRegister(destOp)) {
-        registerPaths.push_back(localPath);
+        llvm::outs() << "found connection to register ";
+        destOp.print(llvm::outs());
+        llvm::outs() << ".\n";
+        toRegPaths.push_back(localPath);
       }
       return true;
     }
@@ -391,21 +466,52 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
     }
 
     bool visitDecl(RegOp op){
+      llvm::outs() << "declaring register ";
+      op.result().print(llvm::outs());
+      llvm::outs() << ".\n";
       valuesLatency[op.result()] = new TimingPathNode(0.0, op, nullptr);
       return true;
     }
 };
 
+class ModulePathTimingInfo {
+public:
+  StringRef startLabel;
+  StringRef endLabel;
+  double latency;
+
+  ModulePathTimingInfo(StringRef startLabel,
+                       StringRef endLabel,
+                       double latency):
+    startLabel(startLabel), endLabel(endLabel), latency(latency) {}
+};
+
+class ModuleTimingInfo {
+  public:
+    FModuleOp module;
+    llvm::DenseMap<StringRef, ModulePathTimingInfo> pathFromStart;
+    llvm::DenseMap<StringRef, ModulePathTimingInfo> pathFromEnd;
+};
+
+
 /// A simple pass that emits errors for any occurrences of `uint`, `sint`, or
 /// `analog` without a known width.
 class CriticalPathAnalysisPass : public CriticalPathAnalysisBase<CriticalPathAnalysisPass> {
+  llvm::DenseMap<StringRef, ModuleTimingInfo> moduleTimings;
+
   void runOnOperation() override;
 
 };
 } // namespace
 
+
+
 void CriticalPathAnalysisPass::runOnOperation() {
   FModuleOp module = getOperation();
+
+  ModuleTimingInfo moduleTiming;
+  ModuleInfo moduleInfo;
+  moduleInfo.module = module;
 
   llvm::outs() << "executing CriticalPathAnalysisPass on " << module.getName().str() << ".\n";
 
@@ -413,11 +519,13 @@ void CriticalPathAnalysisPass::runOnOperation() {
   // port name, so we just point at the module with the port name mentioned in
   // the error.
   for (auto &port : module.getPorts()) {
-    LLVM_DEBUG(llvm::dbgs()
-               << "Port " << port.name << " of type " << port.type << "\n");
+    //LLVM_DEBUG(llvm::dbgs()
+
+    llvm::outs() << "Port " << port.getName() << " of type " << port.type << " isOutput " << port.isOutput() << "\n";
   }
 
   auto latencyEvaluator = ExprLatencyEvaluator();
+  latencyEvaluator.moduleInfo = &moduleInfo;
 
   // list of Operation node awaiting processing
   std::list<Operation*> worklist;
@@ -485,7 +593,7 @@ void CriticalPathAnalysisPass::runOnOperation() {
   llvm::outs() << "Rewiding critical paths:\n";
 
   postProcessPaths(latencyEvaluator.outputPaths);
-  postProcessPaths(latencyEvaluator.registerPaths);
+  // postProcessPaths(latencyEvaluator.toRegPaths);
 
 
   // cleaning memory
