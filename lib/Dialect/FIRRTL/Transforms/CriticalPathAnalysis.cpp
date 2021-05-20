@@ -423,8 +423,8 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
 
     // todo: should use Option-like mechanism to return both path and success flag rather (than inout arg)
     TimingPathNodeOp* getStoredLatency(Value val) {
-      auto it = valuesLatency.find(val);
-      if (it == valuesLatency.end() || it->second->pathLatency < 0) {
+      auto &node = valuesLatency[val];
+      if (!node || node->pathLatency < 0) {
         if (isInputValue(val)) {
             TimingPathNodeOp* inputPath = new TimingPathNodeOp(0.0, val, nullptr);
             valuesLatency[val] = inputPath;
@@ -433,7 +433,7 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
         llvm::outs() << "could not find latency for Value " << val << " defined here: " << val.getDefiningOp() << "\n";
         return nullptr;
       }
-      return it->second;
+      return node;
     }
 
     bool visitStmt(ConnectOp op) {
@@ -554,12 +554,12 @@ void CriticalPathAnalysisPass::runOnOperation() {
     if (!latencyFound)
       worklist.push_back(op);
     else {
-      auto it = latencyEvaluator.valuesLatency.find(op->getOpResult(0));
-      if (it != latencyEvaluator.valuesLatency.end()) {
-        if (nullptr == criticalPathEnd || criticalPathEnd->pathLatency < it->second->pathLatency)
-        criticalPathEnd = (it->second);
+      auto& path = latencyEvaluator.valuesLatency[op->getOpResult(0)];
+      if (!path) {
+        if (nullptr == criticalPathEnd || criticalPathEnd->pathLatency < path->pathLatency)
+        criticalPathEnd = path;
         LLVM_DEBUG(llvm::dbgs()
-                  << "Found latency " << it->second->pathLatency << " for op " << op->getName().getStringRef().str() << "\n");
+                  << "Found latency " << path->pathLatency << " for op " << op->getName().getStringRef().str() << "\n");
       }
     }
   });
@@ -579,13 +579,13 @@ void CriticalPathAnalysisPass::runOnOperation() {
     bool latencyFound = latencyEvaluator.dispatchExprVisitor(op);
 
     if (latencyFound) {
-      auto it = latencyEvaluator.valuesLatency.find(op->getOpResult(0));
-      if (it == latencyEvaluator.valuesLatency.end()) {
+      auto& path = latencyEvaluator.valuesLatency[op->getOpResult(0)];
+      if (!path) {
         LLVM_DEBUG(llvm::dbgs()
                   << "invalid latency for op " << op->getName().getStringRef().str() << "\n");
       } else {
         LLVM_DEBUG(llvm::dbgs()
-                  << "Found latency " << it->second->pathLatency << " for op " << op->getName().getStringRef().str() << "\n");
+                  << "Found latency " << path->pathLatency << " for op " << op->getName().getStringRef().str() << "\n");
       }
     } else {
       worklist.push_back(op);
