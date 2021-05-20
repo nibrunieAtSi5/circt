@@ -273,7 +273,7 @@ bool isOutputValue(Value val) {
 }
 
 
-void postProcessPaths(ModuleInfo& moduleInfo, llvm::SmallVector<TimingPathNodeOp*>& pathVectors) {
+void postProcessPaths(ModuleInfo& moduleInfo, llvm::SmallVector<TimingPathNodeOp*>& pathVectors, bool displayLoc=true) {
   for (auto pathEnd : pathVectors) {
     std::list<TimingPathNodeOp*> localPath;
     TimingPathNodeOp* criticalPathStart = pathEnd;
@@ -292,6 +292,7 @@ void postProcessPaths(ModuleInfo& moduleInfo, llvm::SmallVector<TimingPathNodeOp
          if (isBlockArgument(node->nodeOp)) {
            llvm::outs() << moduleInfo.getPortName(node->nodeOp);
          } else node->nodeOp.print(llvm::outs());
+        if (displayLoc) llvm::outs() << " " << node->nodeOp.getLoc();
         llvm::outs() << "\n";
       }
 
