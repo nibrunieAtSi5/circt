@@ -74,12 +74,15 @@ public:
     auto argIndex = val.cast<BlockArgument>().getArgNumber();
     return !getModulePortInfo(module)[argIndex].isOutput();
   }
+
   // determine if <val> is an output port of <module>
   bool isOutputPort(Value val) {
     if (!isBlockArgument(val)) return false;
     auto argIndex = val.cast<BlockArgument>().getArgNumber();
     return getModulePortInfo(module)[argIndex].isOutput();
   }
+
+  // return the name of a port (if <val> is indeed a port)
   StringRef getPortName(Value val) {
     if (!isBlockArgument(val)) return "<no-input>";
     auto argIndex = val.cast<BlockArgument>().getArgNumber();
@@ -253,37 +256,20 @@ bool isInputField(Type type, StringRef name) {
     .Default([](auto) { return Value();});
  }
 
-bool isInputValue(ModuleInfo* moduleInfo, Value val) {
+// test if <val> is an input port
+bool isInputValue(Value val) {
   if (!val) return false;
-  if (isBlockArgument(val) && moduleInfo->isInputPort(val)) return true;
-  Operation *op = val.getDefiningOp();
-  if (!op) return false;
-  return TypeSwitch<Operation*, bool>(op)
-        .template Case<SubfieldOp>([&](auto op) -> bool {
-             return isInputValue(moduleInfo, op.input());
-            //return isBlockArgument(op.input()) && isInputField(moduleInfo, op.input().getType(), op.fieldname());
-         })
-        .Default([&](auto op) -> double { return false; });
+  auto kind = getDeclarationKind(val);
+  if (kind != DeclKind::Port) return false;
+  return foldFlow(val) == Flow::Source;
 }
 
-bool isOutputValue(ModuleInfo *moduleInfo, Value dest) {
-  if (!dest) return false;
-  llvm::outs() << "testing is block argument ";
-  dest.print(llvm::outs());
-  llvm::outs() << "\n";
-  if (isBlockArgument(dest) && moduleInfo->isOutputPort(dest)) {
-    llvm::outs() << "   is output\n";
-    return true;
-  }
-  llvm::outs() << "   is not output\n";
-  Operation *op = dest.getDefiningOp();
-  if (!op) return false;
-  return TypeSwitch<Operation*, bool>(op)
-        .template Case<SubfieldOp>([&](auto op) -> bool {
-            // return isBlockArgument(op.input()) && !isInputField(op.input().getType(), op.fieldname());
-            return isOutputValue(moduleInfo, op.input());
-         })
-        .Default([&](auto op) -> double { return false; });
+// test if <val> is an output port
+bool isOutputValue(Value val) {
+  if (!val) return false;
+  auto kind = getDeclarationKind(val);
+  if (kind != DeclKind::Port) return false;
+  return foldFlow(val) == Flow::Sink;
 }
 
 
@@ -357,10 +343,10 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
       LLVM_DEBUG(llvm::dbgs()
                 << "SubField's fieldname is " << field << " \n");
       TimingPathNodeOp* previous = nullptr;
-      if (isInputValue(moduleInfo, input)) {
+      if (isInputValue(input)) {
 
       } else {
-        TimingPathNodeOp* prePath = getStoredLatency(moduleInfo, input);
+        TimingPathNodeOp* prePath = getStoredLatency(input);
         if (prePath) return false;
         previous = prePath;
       }
@@ -375,7 +361,7 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
     bool visitMultiAryBitwiseOp(Operation* op, const double opClassLatency) {
       TimingPathNodeOp* longestPath = nullptr;
       for (auto operand: op->getOperands()) {
-        TimingPathNodeOp* prePath = getStoredLatency(moduleInfo, operand);
+        TimingPathNodeOp* prePath = getStoredLatency(operand);
         if (!prePath) return false;
         double operandLatency = prePath->pathLatency;
         if (nullptr == longestPath || operandLatency > longestPath->pathLatency)
@@ -426,7 +412,7 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
     bool visitExpr(MuxPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
 
     bool visitExpr(BitsPrimOp op) {
-      TimingPathNodeOp* prePath = getStoredLatency(moduleInfo, op.input());
+      TimingPathNodeOp* prePath = getStoredLatency(op.input());
       // todo: for now we discard the effect of the selection range
       if (!prePath) return false;
       TimingPathNodeOp* localPath = new TimingPathNodeOp(0.0, op->getOpResult(0), prePath);
@@ -435,11 +421,10 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
     }
 
     // todo: should use Option-like mechanism to return both path and success flag rather (than inout arg)
-    TimingPathNodeOp* getStoredLatency(ModuleInfo *moduleInfo, Value val) {
-      assert(moduleInfo);
+    TimingPathNodeOp* getStoredLatency(Value val) {
       auto it = valuesLatency.find(val);
       if (it == valuesLatency.end() || it->second->pathLatency < 0) {
-        if (isInputValue(moduleInfo, val)) {
+        if (isInputValue(val)) {
             TimingPathNodeOp* inputPath = new TimingPathNodeOp(0.0, val, nullptr);
             valuesLatency[val] = inputPath;
             return inputPath;
@@ -452,10 +437,9 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
 
     bool visitStmt(ConnectOp op) {
       Value srcOp;
-      (void) isOutputValue(moduleInfo, op.dest());
       if (isWire(op.src())) srcOp = getWireValue(op.src());
       else srcOp = op.src();
-      TimingPathNodeOp* path = getStoredLatency(moduleInfo, srcOp);
+      TimingPathNodeOp* path = getStoredLatency(srcOp);
       if (!path) return false;
       Value destOp;
       if (isWire(op.dest())) {
@@ -467,7 +451,7 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
       }
       TimingPathNodeOp *localPath = new TimingPathNodeOp(0.0, destOp, path);
       valuesLatency[destOp] = localPath;
-      if (isOutputValue(moduleInfo, destOp)) {
+      if (isOutputValue(destOp)) {
         llvm::outs() << "found connection to output ";
         destOp.print(llvm::outs());
         llvm::outs() << ".\n";
