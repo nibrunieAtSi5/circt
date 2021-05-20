@@ -80,6 +80,12 @@ public:
     auto argIndex = val.cast<BlockArgument>().getArgNumber();
     return getModulePortInfo(module)[argIndex].isOutput();
   }
+  StringRef getPortName(Value val) {
+    if (!isBlockArgument(val)) return "<no-input>";
+    auto argIndex = val.cast<BlockArgument>().getArgNumber();
+    return getModulePortInfo(module)[argIndex].getName();
+
+  }
 };
 
 
@@ -281,7 +287,7 @@ bool isOutputValue(ModuleInfo *moduleInfo, Value dest) {
 }
 
 
-void postProcessPaths(llvm::SmallVector<TimingPathNodeOp*>& pathVectors) {
+void postProcessPaths(ModuleInfo& moduleInfo, llvm::SmallVector<TimingPathNodeOp*>& pathVectors) {
   for (auto pathEnd : pathVectors) {
     std::list<TimingPathNodeOp*> localPath;
     TimingPathNodeOp* criticalPathStart = pathEnd;
@@ -296,8 +302,12 @@ void postProcessPaths(llvm::SmallVector<TimingPathNodeOp*>& pathVectors) {
     for (auto node : localPath) {
       // result display
       llvm::outs() << "#" << index << ": " << doubleToString(node->nodeLatency) << " " << doubleToString(node->pathLatency) << " ";
-      if (node && node->nodeOp) node->nodeOp.print(llvm::outs());
-      llvm::outs() << "\n";
+      if (node && node->nodeOp) {
+         if (isBlockArgument(node->nodeOp)) {
+           llvm::outs() << moduleInfo.getPortName(node->nodeOp);
+         } else node->nodeOp.print(llvm::outs());
+        llvm::outs() << "\n";
+      }
 
       index++;
     }
@@ -602,8 +612,8 @@ void CriticalPathAnalysisPass::runOnOperation() {
   // start by looking for path start
   llvm::outs() << "Rewiding critical paths:\n";
 
-  postProcessPaths(latencyEvaluator.outputPaths);
-  // postProcessPaths(latencyEvaluator.toRegPaths);
+  postProcessPaths(moduleInfo, latencyEvaluator.outputPaths);
+  postProcessPaths(moduleInfo, latencyEvaluator.toRegPaths);
 
 
   // cleaning memory
