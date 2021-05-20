@@ -32,17 +32,18 @@ namespace {
 
 
 // node in a TimingPath
+template <class T>
 class TimingPathNode {
   public:
     /// local node latency
     double nodeLatency;
-    Operation *nodeOp;
+    T nodeOp;
     // index of Value/OpResult in nodeOp corresponding to local value
     int resultIndex;
     /// pointer to previous node (upstream) in the critical path
-    TimingPathNode *previousNode;
+    TimingPathNode<T> *previousNode;
     /// pointer to the next node (downstream) in the critical path
-    TimingPathNode *nextNode;
+    TimingPathNode<T> *nextNode;
     /// latency of the critical path ending at this node (including
     //  this node local latency)
     double pathLatency;
@@ -50,13 +51,15 @@ class TimingPathNode {
     TimingPathNode(): nodeLatency(0.0), nodeOp(nullptr), resultIndex(-1), previousNode(nullptr),
                       nextNode(nullptr), pathLatency(0.0) {}
 
-    TimingPathNode(double latency, Operation* op, TimingPathNode* previous, int index=0):
+    TimingPathNode(double latency, T op, TimingPathNode<T>* previous, int index=0):
       nodeLatency(latency), resultIndex(index), previousNode(previous), nextNode(nullptr) {
         nodeOp = op;
         pathLatency = (previous ? previousNode->pathLatency : 0.0) + nodeLatency;
         if (previous) previous->nextNode = this;
       }
 };
+
+using TimingPathNodeOp = TimingPathNode<Value>;
 
 // return true if <val> is one of its block's argument
 bool isBlockArgument(Value val) { return val.isa<BlockArgument>(); }
@@ -278,10 +281,10 @@ bool isOutputValue(ModuleInfo *moduleInfo, Value dest) {
 }
 
 
-void postProcessPaths(llvm::SmallVector<TimingPathNode*>& pathVectors) {
+void postProcessPaths(llvm::SmallVector<TimingPathNodeOp*>& pathVectors) {
   for (auto pathEnd : pathVectors) {
-    std::list<TimingPathNode*> localPath;
-    TimingPathNode* criticalPathStart = pathEnd;
+    std::list<TimingPathNodeOp*> localPath;
+    TimingPathNodeOp* criticalPathStart = pathEnd;
     while (criticalPathStart != nullptr && criticalPathStart->previousNode != nullptr) {
       LLVM_DEBUG(llvm::dbgs() << "  Found new node." << criticalPathStart << " " << criticalPathStart->nodeOp << "\n");
     localPath.push_front(criticalPathStart);
@@ -293,7 +296,7 @@ void postProcessPaths(llvm::SmallVector<TimingPathNode*>& pathVectors) {
     for (auto node : localPath) {
       // result display
       llvm::outs() << "#" << index << ": " << doubleToString(node->nodeLatency) << " " << doubleToString(node->pathLatency) << " ";
-      if (node && node->nodeOp) node->nodeOp->getOpResult(node->resultIndex).print(llvm::outs());
+      if (node && node->nodeOp) node->nodeOp.print(llvm::outs());
       llvm::outs() << "\n";
 
       index++;
@@ -304,10 +307,10 @@ void postProcessPaths(llvm::SmallVector<TimingPathNode*>& pathVectors) {
 struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
   public:
     // llvm::DenseMap<Operation, double> opsLatency;
-    llvm::DenseMap<Value, TimingPathNode*> valuesLatency;
-    llvm::SmallVector<TimingPathNode*> outputPaths;
-    llvm::SmallVector<TimingPathNode*> fromRegPaths;
-    llvm::SmallVector<TimingPathNode*> toRegPaths;
+    llvm::DenseMap<Value, TimingPathNodeOp*> valuesLatency;
+    llvm::SmallVector<TimingPathNodeOp*> outputPaths;
+    llvm::SmallVector<TimingPathNodeOp*> fromRegPaths;
+    llvm::SmallVector<TimingPathNodeOp*> toRegPaths;
     ModuleInfo* moduleInfo;
 
     using FIRRTLVisitor<ExprLatencyEvaluator, bool>::visitExpr;
@@ -334,7 +337,7 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
 
     // constant operation have zero-latency
     bool visitExpr(ConstantOp op) {
-      valuesLatency[op->getOpResult(0)] = new TimingPathNode(0.0, op, nullptr);
+      valuesLatency[op->getOpResult(0)] = new TimingPathNodeOp(0.0, op->getOpResult(0), nullptr);
       return true;
      }
 
@@ -343,15 +346,15 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
       auto field = op.fieldname();
       LLVM_DEBUG(llvm::dbgs()
                 << "SubField's fieldname is " << field << " \n");
-      TimingPathNode* previous = nullptr;
+      TimingPathNodeOp* previous = nullptr;
       if (isInputValue(moduleInfo, input)) {
 
       } else {
-        TimingPathNode* prePath = getStoredLatency(moduleInfo, input);
+        TimingPathNodeOp* prePath = getStoredLatency(moduleInfo, input);
         if (prePath) return false;
         previous = prePath;
       }
-      TimingPathNode* pathNode = new TimingPathNode(0.0, op, previous);
+      TimingPathNodeOp* pathNode = new TimingPathNodeOp(0.0, op->getOpResult(0), previous);
       LLVM_DEBUG(llvm::dbgs()
                 << "Inner Found latency " << pathNode->pathLatency << " for op " << op->getName().getStringRef().str() << "\n");
       valuesLatency[op->getOpResult(0)] = pathNode;
@@ -360,15 +363,15 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
 
     // visit generic multi-ary bitwise operation (e.g. Xor, And ...)
     bool visitMultiAryBitwiseOp(Operation* op, const double opClassLatency) {
-      TimingPathNode* longestPath = nullptr;
+      TimingPathNodeOp* longestPath = nullptr;
       for (auto operand: op->getOperands()) {
-        TimingPathNode* prePath = getStoredLatency(moduleInfo, operand);
+        TimingPathNodeOp* prePath = getStoredLatency(moduleInfo, operand);
         if (!prePath) return false;
         double operandLatency = prePath->pathLatency;
         if (nullptr == longestPath || operandLatency > longestPath->pathLatency)
           longestPath = prePath;
       }
-      valuesLatency[op->getOpResult(0)] = new TimingPathNode(opClassLatency, op, longestPath);
+      valuesLatency[op->getOpResult(0)] = new TimingPathNodeOp(opClassLatency, op->getOpResult(0), longestPath);
       return true;
 
     }
@@ -413,21 +416,21 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
     bool visitExpr(MuxPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
 
     bool visitExpr(BitsPrimOp op) {
-      TimingPathNode* prePath = getStoredLatency(moduleInfo, op.input());
+      TimingPathNodeOp* prePath = getStoredLatency(moduleInfo, op.input());
       // todo: for now we discard the effect of the selection range
       if (!prePath) return false;
-      TimingPathNode* localPath = new TimingPathNode(0.0, op, prePath);
+      TimingPathNodeOp* localPath = new TimingPathNodeOp(0.0, op->getOpResult(0), prePath);
       valuesLatency[op->getOpResult(0)] = localPath;
       return true;
     }
 
     // todo: should use Option-like mechanism to return both path and success flag rather (than inout arg)
-    TimingPathNode* getStoredLatency(ModuleInfo *moduleInfo, Value val) {
+    TimingPathNodeOp* getStoredLatency(ModuleInfo *moduleInfo, Value val) {
       assert(moduleInfo);
       auto it = valuesLatency.find(val);
       if (it == valuesLatency.end() || it->second->pathLatency < 0) {
         if (isInputValue(moduleInfo, val)) {
-            TimingPathNode* inputPath = new TimingPathNode(0.0, nullptr, nullptr);
+            TimingPathNodeOp* inputPath = new TimingPathNodeOp(0.0, val, nullptr);
             valuesLatency[val] = inputPath;
             return inputPath;
         }
@@ -442,7 +445,7 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
       (void) isOutputValue(moduleInfo, op.dest());
       if (isWire(op.src())) srcOp = getWireValue(op.src());
       else srcOp = op.src();
-      TimingPathNode* path = getStoredLatency(moduleInfo, srcOp);
+      TimingPathNodeOp* path = getStoredLatency(moduleInfo, srcOp);
       if (!path) return false;
       Value destOp;
       if (isWire(op.dest())) {
@@ -452,7 +455,7 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
       } else {
         destOp = op.dest();
       }
-      TimingPathNode* localPath = new TimingPathNode(0.0, destOp.getDefiningOp(), path);
+      TimingPathNodeOp *localPath = new TimingPathNodeOp(0.0, destOp, path);
       valuesLatency[destOp] = localPath;
       if (isOutputValue(moduleInfo, destOp)) {
         llvm::outs() << "found connection to output ";
@@ -476,7 +479,7 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
       llvm::outs() << "declaring register ";
       op.result().print(llvm::outs());
       llvm::outs() << ".\n";
-      valuesLatency[op.result()] = new TimingPathNode(0.0, op, nullptr);
+      valuesLatency[op.result()] = new TimingPathNodeOp(0.0, op.result(), nullptr);
       return true;
     }
 };
@@ -538,7 +541,7 @@ void CriticalPathAnalysisPass::runOnOperation() {
   std::list<Operation*> worklist;
 
   // temporary determined critical path end node
-  TimingPathNode* criticalPathEnd = nullptr;
+  TimingPathNodeOp* criticalPathEnd = nullptr;
 
   // Check the results of each operation.
   module->walk([&](Operation *op) {
