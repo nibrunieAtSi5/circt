@@ -30,6 +30,16 @@ using namespace firrtl;
 
 namespace {
 
+/// Convert double precision value to string (used when injecting latency
+//  measurement into llvm::outs() )
+std::string doubleToString(double value, int prec=3) {
+  std::ostringstream streamObj;
+  streamObj << std::fixed << std::setprecision(prec) << value;
+  return streamObj.str();
+}
+
+// return true if <val> is one of its block's argument
+bool isBlockArgument(Value val) { return val.isa<BlockArgument>(); }
 
 // node in a TimingPath
 template <class T>
@@ -87,10 +97,72 @@ class TimingPathNode {
       if (nextNode) newNode->nextNode = nextNode->copyPathUpstream();
       return newNode;
     }
+
+    void print(raw_ostream& stream, bool displayLoc=false);
 };
 
 using TimingPathNodeOp = TimingPathNode<Value>;
 
+StringRef getModulePortName(Value val) {
+  assert(isBlockArgument(val) && "val must be a BlockArgument in getModulePortName");
+  FModuleOp module = cast<FModuleOp>(val.cast<BlockArgument>().getOwner()->getParentOp());
+  auto argIndex = val.cast<BlockArgument>().getArgNumber();
+  auto portName = getModulePortInfo(module)[argIndex].getName();
+  return portName;
+}
+
+template<> void TimingPathNodeOp::print(raw_ostream& stream, bool displayLoc) {
+  // todo: clean, mixing stream and diagnostic handler with emitRemark is a bad idea
+  if (nodeOp) {
+     if (isBlockArgument(nodeOp)) {
+       stream << getModulePortName(nodeOp);
+     } else nodeOp.getDefiningOp()->emitRemark("CP step"); // print(llvm::outs());
+    if (displayLoc) stream << " " << nodeOp.getLoc();
+    stream << "\n";
+  }
+}
+
+class TimingPath {
+public:
+  TimingPathNodeOp* startPoint;
+  TimingPathNodeOp* endPoint;
+  double latency;
+  std::list<TimingPathNodeOp*> nodes;
+  TimingPath(TimingPathNodeOp* node) {
+    endPoint = node->getPathLastNode();
+    TimingPathNodeOp* current = endPoint;
+    while (current) {
+      // todo: need to go from node to previous as going downstream seems broken
+      // but push_front / vector is certainly costly
+      nodes.push_front(current);
+      current = current->previousNode;
+    }
+    startPoint = nodes.front();
+    latency = endPoint->pathLatency;
+  }
+
+  void print(raw_ostream& stream, bool displayLoc=false) {
+    int index = 0;
+    stream << "critical path:\n";
+    stream << "    Start point: ";
+    startPoint->print(stream);
+    stream << "    End   point: ";
+    endPoint->print(stream);
+    stream << "    Latency:     " << doubleToString(latency) << "\n";
+    for (auto node : nodes) {
+      // result display
+      stream << "#" << index << ": " << doubleToString(node->nodeLatency) << " " << doubleToString(node->pathLatency) << " ";
+      if (node && node->nodeOp) {
+         if (isBlockArgument(node->nodeOp)) {
+           stream << getModulePortName(node->nodeOp);
+         } else node->nodeOp.print(stream);
+        if (displayLoc) stream << " " << node->nodeOp.getLoc();
+        stream << "\n";
+      }
+      index++;
+    }
+  }
+};
 
 class ModulePathTimingInfo {
 public:
@@ -126,8 +198,6 @@ public:
 
 
 
-// return true if <val> is one of its block's argument
-bool isBlockArgument(Value val) { return val.isa<BlockArgument>(); }
 
 class ModuleInfo {
 public:
@@ -156,15 +226,6 @@ public:
   }
 };
 
-
-
-/// Convert double precision value to string (used when injecting latency
-//  measurement into llvm::outs() )
-std::string doubleToString(double value, int prec=3) {
-  std::ostringstream streamObj;
-  streamObj << std::fixed << std::setprecision(prec) << value;
-  return streamObj.str();
-}
 
 /// Extract a FIRRTL Type's width (if any else return -1)
 int getWidth(Type type) {
@@ -338,31 +399,12 @@ bool isOutputValue(Value val) {
 }
 
 
+//
+// <pathVector> is a vector a final nodes for paths to be displayed
 void postProcessPaths(ModuleInfo& moduleInfo, llvm::SmallVector<TimingPathNodeOp*>& pathVectors, bool displayLoc=true) {
   for (auto pathEnd : pathVectors) {
-    std::list<TimingPathNodeOp*> localPath;
-    TimingPathNodeOp* criticalPathStart = pathEnd;
-    while (criticalPathStart != nullptr && criticalPathStart->previousNode != nullptr) {
-      LLVM_DEBUG(llvm::dbgs() << "  Found new node." << criticalPathStart << " " << criticalPathStart->nodeOp << "\n");
-    localPath.push_front(criticalPathStart);
-      criticalPathStart = criticalPathStart->previousNode;
-    }
-    if (criticalPathStart) localPath.push_front(criticalPathStart);
-    int index = 0;
-    llvm::outs() << "critical path is:\n";
-    for (auto node : localPath) {
-      // result display
-      llvm::outs() << "#" << index << ": " << doubleToString(node->nodeLatency) << " " << doubleToString(node->pathLatency) << " ";
-      if (node && node->nodeOp) {
-         if (isBlockArgument(node->nodeOp)) {
-           llvm::outs() << moduleInfo.getPortName(node->nodeOp);
-         } else node->nodeOp.print(llvm::outs());
-        if (displayLoc) llvm::outs() << " " << node->nodeOp.getLoc();
-        llvm::outs() << "\n";
-      }
-
-      index++;
-    }
+    TimingPath localPath(pathEnd);
+    localPath.print(llvm::outs()), displayLoc;
   }
 }
 
@@ -688,9 +730,6 @@ void CriticalPathAnalysisPass::runOnOperation() {
 
   // todo: need a more canonical part to display result info
   // critical path traversal
-  // start by looking for path start
-  llvm::outs() << "Rewinding critical paths:\n";
-
   postProcessPaths(moduleInfo, latencyEvaluator.outputPaths);
   postProcessPaths(moduleInfo, latencyEvaluator.toRegPaths);
 
