@@ -41,6 +41,17 @@ std::string doubleToString(double value, int prec=3) {
 // return true if <val> is one of its block's argument
 bool isBlockArgument(Value val) { return val.isa<BlockArgument>(); }
 
+// test if <val> is a Register operation (directly or recursively)
+bool isRegister(Value val) {
+  if (!val) return false;
+  Operation* op = val.getDefiningOp();
+  if (!op)
+    return false;
+  return TypeSwitch<Operation *, bool>(op)
+    .Case<SubfieldOp>([](auto op) { return isRegister(op.input());})
+    .Case<RegOp, RegResetOp>([](auto) { return true;})
+    .Default([](auto) { return false;});
+}
 
 // predicate testing if an op can be discarded while building critical paths
 bool discardableOp(Operation* op) {
@@ -48,6 +59,12 @@ bool discardableOp(Operation* op) {
   .Case<FModuleOp, PrintFOp, StopOp>([](auto op) { return true;})
   .Default([](auto) { return false;});
 }
+
+// check if <val> can be a timing path termination (I/O or register)
+bool isPathTerminationValue(Value val) {
+  return isBlockArgument(val) || isRegister(val);
+}
+
 // node in a TimingPath
 template <class T>
 class TimingPathNode {
@@ -76,14 +93,22 @@ class TimingPathNode {
         pathLatency = (previous ? previousNode->pathLatency : 0.0) + nodeLatency;
         if (previous) previous->nextNode = this;
     }
-    TimingPathNode* getPathFirstNode() {
+
+    bool isPathTerminationNode();
+    // determine the first node (start point) of a critical timing path going through
+    // this node
+    // @param discardCurrent does not consider current not as a potential candidate
+    TimingPathNode* getPathFirstNode(bool discardCurrent=false) {
       TimingPathNode* current = this;
-      while (current->previousNode) current = current->previousNode;
+      while (current->previousNode && (!current->isPathTerminationNode() || (current == this && discardCurrent))) current = current->previousNode;
       return current;
     }
-    TimingPathNode* getPathLastNode() {
+    // determine the last node (end point) of a critical timing path going through
+    // this node
+    // @param discardCurrent does not consider current not as a potential candidate
+    TimingPathNode* getPathLastNode(bool discardCurrent=false) {
       TimingPathNode* current = this;
-      while (current->nextNode) current = current->nextNode;
+      while (current->nextNode && (!current->isPathTerminationNode() || (current == this && discardCurrent))) current = current->nextNode;
       return current;
     }
 
@@ -127,6 +152,10 @@ template<> void TimingPathNodeOp::print(raw_ostream& stream, bool displayLoc) {
     if (displayLoc) stream << " " << nodeOp.getLoc();
     stream << "\n";
   }
+}
+
+template<> bool TimingPathNodeOp::isPathTerminationNode(){
+  return isPathTerminationValue(nodeOp);
 }
 
 class TimingPath {
@@ -368,17 +397,6 @@ bool isInputField(Type type, StringRef name) {
     .Default([](auto) { return Value();});
  }
 
-// test if <val> is a Register operation (directly or recursively)
- bool isRegister(Value val) {
-  if (!val) return false;
-  Operation* op = val.getDefiningOp();
-  if (!op)
-    return false;
-  return TypeSwitch<Operation *, bool>(op)
-    .Case<SubfieldOp>([](auto op) { return isRegister(op.input());})
-    .Case<RegOp, RegResetOp>([](auto) { return true;})
-    .Default([](auto) { return false;});
- }
 
 // extract the RegOp associated to val
  Value getRegisterValue(Value val) {
@@ -628,7 +646,7 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
         auto &path = moduleTimingInfo->pathFromEnd[port.getName()];
         if (true) { // todo: should check if port.getName() appears in map
           auto newPath = path.path->copyPathUpstream();
-          newPath->getPathFirstNode()->previousNode = latencyByPortName[path.startLabel];
+          newPath->getPathFirstNode(true /* discardCurrent*/ )->previousNode = latencyByPortName[path.startLabel];
           valuesLatency[op->getOpResult(portIdx)] = newPath->getPathLastNode();
         } else {
           llvm::outs() << "could not find internal path for output port " << port.name << " of module " << op.moduleName() << ".\n";
