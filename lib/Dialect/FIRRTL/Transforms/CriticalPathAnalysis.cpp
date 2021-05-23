@@ -41,6 +41,13 @@ std::string doubleToString(double value, int prec=3) {
 // return true if <val> is one of its block's argument
 bool isBlockArgument(Value val) { return val.isa<BlockArgument>(); }
 
+
+// predicate testing if an op can be discarded while building critical paths
+bool discardableOp(Operation* op) {
+  return TypeSwitch<Operation *, bool>(op)
+  .Case<FModuleOp, PrintFOp, StopOp>([](auto op) { return true;})
+  .Default([](auto) { return false;});
+}
 // node in a TimingPath
 template <class T>
 class TimingPathNode {
@@ -700,13 +707,14 @@ void CriticalPathAnalysisPass::runOnOperation() {
     }
   });
 
-  while (false && !worklist.empty()) {
+
+  while (!worklist.empty()) {
     Operation* op = worklist.front();
     LLVM_DEBUG(llvm::dbgs()
                << "Processing " << op->getName().getStringRef().str() << "\n");
     worklist.pop_front();
 
-    if (auto mod = dyn_cast<FModuleOp>(op)) {
+    if (discardableOp(op)) {
       LLVM_DEBUG(llvm::dbgs()
                 << "Found to discard: " << op->getName().getStringRef().str() << "\n");
       continue;
