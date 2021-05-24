@@ -202,7 +202,7 @@ public:
          if (isBlockArgument(node->nodeOp)) {
            stream << getModulePortName(node->nodeOp);
          } else node->nodeOp.print(stream);
-        if (displayLoc) stream << " " << node->nodeOp.getLoc();
+        if (displayLoc) stream << "\n  " << node->nodeOp.getLoc();
         stream << "\n";
       }
       index++;
@@ -840,7 +840,7 @@ void CriticalPathAnalysisPass::runOnOperation() {
   // critical path traversal
   moduleTiming->registerOutputPath(latencyEvaluator.outputPaths);
   moduleTiming->registerPathToRegs(latencyEvaluator.toRegPaths);
-  moduleTiming->displayPaths();
+  moduleTiming->displayPaths(true);
   llvm::outs() << "register module timing info for " << module.getName() << "\n";
   moduleMap.registerModuleTimingInfo(module.getName(), moduleTiming);
 
