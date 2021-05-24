@@ -65,6 +65,10 @@ bool isPathTerminationValue(Value val) {
   return isBlockArgument(val) || isRegister(val);
 }
 
+class ModuleTimingInfo;
+class TimingPath;
+StringRef getModuleNameFromInfo(ModuleTimingInfo*);
+
 // node in a TimingPath
 template <class T>
 class TimingPathNode {
@@ -81,14 +85,16 @@ class TimingPathNode {
     /// latency of the critical path ending at this node (including
     //  this node local latency)
     double pathLatency;
+    // pointer towards the module where this path is located
+    ModuleTimingInfo* moduleTimingInfo;
 
     TimingPathNode(): nodeLatency(0.0), nodeOp(nullptr), resultIndex(-1), previousNode(nullptr),
-                      nextNode(nullptr), pathLatency(0.0) {}
+                      nextNode(nullptr), pathLatency(0.0), moduleTimingInfo(nullptr) {}
 
     TimingPathNode(TimingPathNode& _rvalue) = default;
 
-    TimingPathNode(double latency, T op, TimingPathNode<T>* previous, int index=0):
-      nodeLatency(latency), resultIndex(index), previousNode(previous), nextNode(nullptr) {
+    TimingPathNode(double latency, T op, TimingPathNode<T>* previous, int index=0, ModuleTimingInfo* _module=nullptr):
+      nodeLatency(latency), resultIndex(index), previousNode(previous), nextNode(nullptr), moduleTimingInfo(_module) {
         nodeOp = op;
         pathLatency = (previous ? previousNode->pathLatency : 0.0) + nodeLatency;
         if (previous) previous->nextNode = this;
@@ -114,10 +120,10 @@ class TimingPathNode {
 
     // copy path starting from this node and rewinding upstream
     // in the copied path this node copy will have no nextNode
-    TimingPathNode* copyPathUpstream() {
+    TimingPathNode* copyPathUpstream(TimingPathNode* next=nullptr) {
       TimingPathNode* newNode = new TimingPathNode(*this);
-      newNode->nextNode = nullptr;
-      if (previousNode) newNode->previousNode = previousNode->copyPathUpstream();
+      newNode->nextNode = next;
+      if (previousNode) newNode->previousNode = previousNode->copyPathUpstream(newNode);
       return newNode;
     }
 
@@ -164,10 +170,13 @@ public:
   TimingPathNodeOp* endPoint;
   double latency;
   std::list<TimingPathNodeOp*> nodes;
-  TimingPath(TimingPathNodeOp* node) {
+  TimingPath(TimingPathNodeOp* node, ModuleTimingInfo* moduleTimingInfo) {
     endPoint = node->getPathLastNode();
     TimingPathNodeOp* current = endPoint;
     while (current) {
+      // setting module associated with path's node
+      // (only when unset)
+      if (!current->moduleTimingInfo) current->moduleTimingInfo = moduleTimingInfo;
       // todo: need to go from node to previous as going downstream seems broken
       // but push_front / vector is certainly costly
       nodes.push_front(current);
@@ -189,6 +198,7 @@ public:
       // result display
       stream << "#" << index << ": " << doubleToString(node->nodeLatency) << " " << doubleToString(node->pathLatency) << " ";
       if (node && node->nodeOp) {
+        stream << (node->moduleTimingInfo ? (getModuleNameFromInfo(node->moduleTimingInfo) + " ") : "");
          if (isBlockArgument(node->nodeOp)) {
            stream << getModulePortName(node->nodeOp);
          } else node->nodeOp.print(stream);
@@ -198,41 +208,113 @@ public:
       index++;
     }
   }
+
+  bool startAtInput() {
+    return isBlockArgument(startPoint->nodeOp) && foldFlow(startPoint->nodeOp) == Flow::Source;
+  }
+  bool startAtRegister() {
+    return isRegister(startPoint->nodeOp);
+  }
+  bool endAtOutput() {
+    // todo: output may also be Flow::Duplex if they are re-used as expression source
+    // in the same module
+    return isBlockArgument(endPoint->nodeOp) && foldFlow(endPoint->nodeOp) == Flow::Sink;
+  }
+  bool endAtRegister() {
+    return isRegister(endPoint->nodeOp);
+  }
+
+  StringRef startLabel() {
+    if (startAtRegister()) return "<register>";
+    else return getModulePortName(startPoint->nodeOp);
+  }
+  StringRef endLabel() {
+    if (endAtRegister()) return "<register>";
+    else return getModulePortName(endPoint->nodeOp);
+  }
 };
 
 class ModulePathTimingInfo {
 public:
   StringRef startLabel;
   StringRef endLabel;
-  TimingPathNodeOp* path;
+  TimingPath path;
 
   ModulePathTimingInfo() = default;
 
   ModulePathTimingInfo(StringRef startLabel,
                        StringRef endLabel,
-                       TimingPathNodeOp* _path):
+                       TimingPath _path):
     startLabel(startLabel), endLabel(endLabel), path(_path) {}
 };
 
 class ModuleTimingInfo {
   public:
     FModuleOp module;
-    ModuleTimingInfo(FModuleOp mod) : module(mod) {}
-    llvm::DenseMap<StringRef, ModulePathTimingInfo> pathFromStart;
-    llvm::DenseMap<StringRef, ModulePathTimingInfo> pathFromEnd;
+    SmallVector<ModulePortInfo, 8> portInfo;
+    ModuleTimingInfo(FModuleOp mod) : module(mod) {
+      portInfo = getModulePortInfo(mod);
+    }
+    // llvm::DenseMap<StringRef, ModulePathTimingInfo> pathFromStart; -> no unicity of critical-path seen from start point
+    llvm::DenseMap<StringRef, ModulePathTimingInfo*> pathFromOutput;
+    llvm::SmallVector<TimingPath> pathToRegs;
+
+    ModulePathTimingInfo* getPathFromOutput(StringRef portName) {
+      for (auto label_path : pathFromOutput) {
+        llvm::outs() << "label_path.first=" << label_path.first.str() << " portName.str=" << portName.str() << "\n";
+        if (label_path.first.str() == portName.str()) return label_path.second;
+      }
+      return nullptr;
+    }
+
+    // register the list of critical module paths which ends at a module output
+    void registerOutputPath(llvm::SmallVector<TimingPathNodeOp*> &pathVector) {
+      for (auto pathEnd: pathVector) {
+        TimingPath localPath(pathEnd, this);
+        llvm::outs() << "registering path for module " << module.getName() << " ending at " << localPath.endLabel() << " " << localPath.endAtOutput() << "\n";
+        if (localPath.endAtOutput()) {
+          pathFromOutput[localPath.endLabel()] = new ModulePathTimingInfo(localPath.startLabel(), localPath.endLabel(), localPath);
+        }
+      }
+    }
+
+    // register the list of critical module paths which ends at a module register
+    void registerPathToRegs(llvm::SmallVector<TimingPathNodeOp*> &pathVector) {
+      for (auto pathEnd: pathVector) {
+        TimingPath localPath(pathEnd, this);
+        pathToRegs.push_back(localPath);
+      }
+    }
+
+    void displayPaths(bool displayLoc=false) {
+        llvm::outs() << "Critical path for module" << module.getName() << "\n";
+        llvm::outs() << "== path from output" << module.getName() << "\n";
+        for (auto it : pathFromOutput) {
+          it.second->path.print(llvm::outs(), displayLoc);
+        }
+        llvm::outs() << "== path from register" << module.getName() << "\n";
+        for (auto path : pathToRegs) {
+          path.print(llvm::outs(), displayLoc);
+        }
+    }
 };
 
+StringRef getModuleNameFromInfo(ModuleTimingInfo* moduleInfo) {
+  return moduleInfo->module.getName();
+}
 
 class MapModuleTimingInfo {
 public:
   DenseMap<StringRef, ModuleTimingInfo*> moduleMap;
 
+  // todo: clean bad memory management: moduleTimingInfo is allocated somewhere and never free-ed
+  void registerModuleTimingInfo(StringRef moduleName, ModuleTimingInfo* moduleTimingInfo) {
+    moduleMap[moduleName] = moduleTimingInfo;
+  }
   ModuleTimingInfo* getModuleTimingInfoByName(StringRef moduleName) {
     return moduleMap[moduleName];
   }
 };
-
-
 
 
 class ModuleInfo {
@@ -424,14 +506,6 @@ bool isOutputValue(Value val) {
 }
 
 
-//
-// <pathVector> is a vector a final nodes for paths to be displayed
-void postProcessPaths(ModuleInfo& moduleInfo, llvm::SmallVector<TimingPathNodeOp*>& pathVectors, bool displayLoc=true) {
-  for (auto pathEnd : pathVectors) {
-    TimingPath localPath(pathEnd);
-    localPath.print(llvm::outs()), displayLoc;
-  }
-}
 
 struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
   public:
@@ -623,12 +697,12 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
         llvm::errs() << "in InstanceOp, unknown module: " << op.moduleName() << "\n";
         return false;
       }
-      SmallVector<ModulePortInfo, 8> portInfo = getModulePortInfo(op);
+      // SmallVector<ModulePortInfo, 8> portInfo = getModulePortInfo(op);
 
       llvm::SmallDenseMap<StringRef, TimingPathNodeOp*> latencyByPortName;
       // processing input latencies first
-      for (unsigned portIdx = 0, e = portInfo.size(); portIdx != e; ++portIdx) {
-        auto port = portInfo[portIdx];
+      for (unsigned portIdx = 0, e = moduleTimingInfo->portInfo.size(); portIdx != e; ++portIdx) {
+        auto port = moduleTimingInfo->portInfo[portIdx];
         if (port.isOutput()) continue;
         // input
         auto inputPath = getStoredLatency(op->getOpResult(portIdx));
@@ -639,17 +713,26 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
         latencyByPortName[port.getName()] = inputPath;
       }
       // processing outputs
-      for (unsigned portIdx = 0, e = portInfo.size(); portIdx != e; ++portIdx) {
-        auto port = portInfo[portIdx];
+      for (unsigned portIdx = 0, e = moduleTimingInfo->portInfo.size(); portIdx != e; ++portIdx) {
+        auto port = moduleTimingInfo->portInfo[portIdx];
         if (!port.isOutput()) continue;
 
-        auto &path = moduleTimingInfo->pathFromEnd[port.getName()];
-        if (true) { // todo: should check if port.getName() appears in map
-          auto newPath = path.path->copyPathUpstream();
-          newPath->getPathFirstNode(true /* discardCurrent*/ )->previousNode = latencyByPortName[path.startLabel];
+        StringRef portName = port.getName();
+        ModulePathTimingInfo* path = moduleTimingInfo->getPathFromOutput(portName);
+        if (path) { // todo: should check if port.getName() appears in map
+          auto newPath = path->path.endPoint->copyPathUpstream();
+          auto internalPathStart = newPath->getPathFirstNode(true /* discardCurrent*/ );
+          // if the internal path start is a module input (not a register) we connect
+          // its start to the path outside the instantiated module
+          if (!isRegister(internalPathStart->nodeOp))
+            internalPathStart->previousNode = latencyByPortName[path->startLabel];
           valuesLatency[op->getOpResult(portIdx)] = newPath->getPathLastNode();
         } else {
-          llvm::outs() << "could not find internal path for output port " << port.name << " of module " << op.moduleName() << ".\n";
+          llvm::errs() << "could not find internal path for output port " << portName << " of module " << op.moduleName() << ".\n";
+          for (auto port : moduleTimingInfo->pathFromOutput) {
+            llvm::errs() << "registered ports are: " << port.first << "\n";
+          }
+          llvm::report_fatal_error("module instancing failed.");
           return false;
         }
       }
@@ -661,14 +744,13 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
 /// A simple pass that emits errors for any occurrences of `uint`, `sint`, or
 /// `analog` without a known width.
 class CriticalPathAnalysisPass : public CriticalPathAnalysisBase<CriticalPathAnalysisPass> {
-  llvm::DenseMap<StringRef, ModuleTimingInfo> moduleTimings;
+  // llvm::DenseMap<StringRef, ModuleTimingInfo> moduleTimings;
 
   void runOnOperation() override;
 
   MapModuleTimingInfo moduleMap;
 };
 } // namespace
-
 
 
 void CriticalPathAnalysisPass::runOnOperation() {
@@ -756,15 +838,21 @@ void CriticalPathAnalysisPass::runOnOperation() {
 
   // todo: need a more canonical part to display result info
   // critical path traversal
-  postProcessPaths(moduleInfo, latencyEvaluator.outputPaths);
-  postProcessPaths(moduleInfo, latencyEvaluator.toRegPaths);
+  moduleTiming->registerOutputPath(latencyEvaluator.outputPaths);
+  moduleTiming->registerPathToRegs(latencyEvaluator.toRegPaths);
+  moduleTiming->displayPaths();
+  llvm::outs() << "register module timing info for " << module.getName() << "\n";
+  moduleMap.registerModuleTimingInfo(module.getName(), moduleTiming);
 
+  // register's module critical path
 
   // cleaning memory
   LLVM_DEBUG(llvm::dbgs() << "cleaning memory.\n");
-  for (auto it : latencyEvaluator.valuesLatency) {
-    delete it.second;
-  }
+  // todo: cleaning memory commented-out because we may need path in other modules
+  // -> should be clean-up eventually
+  // for (auto it : latencyEvaluator.valuesLatency) {
+  //  delete it.second;
+  // }
 
   // todo: keep ?
   markAllAnalysesPreserved();
