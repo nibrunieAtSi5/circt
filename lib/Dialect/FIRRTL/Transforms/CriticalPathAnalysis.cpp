@@ -70,6 +70,10 @@ class TimingPath;
 StringRef getModuleNameFromInfo(ModuleTimingInfo*);
 
 // node in a TimingPath
+//
+// This object stores the information for a "step" in a timing path
+// - link to previous and next nodes
+// - local operation and associated latency information
 template <class T>
 class TimingPathNode {
   public:
@@ -100,7 +104,10 @@ class TimingPathNode {
         if (previous) previous->nextNode = this;
     }
 
+    // determine if this node is a candidate to terminate (start/finish) a timing
+    // path (e.g. being a register, being a top-module input/output ...)
     bool isPathTerminationNode();
+
     // determine the first node (start point) of a critical timing path going through
     // this node
     // @param discardCurrent does not consider current not as a potential candidate
@@ -109,6 +116,7 @@ class TimingPathNode {
       while (current->previousNode && (!current->isPathTerminationNode() || (current == this && discardCurrent))) current = current->previousNode;
       return current;
     }
+
     // determine the last node (end point) of a critical timing path going through
     // this node
     // @param discardCurrent does not consider current not as a potential candidate
@@ -136,11 +144,16 @@ class TimingPathNode {
       return newNode;
     }
 
+    // display node information on \p stream
     void print(raw_ostream& stream, bool displayLoc=false);
 };
 
+// specialization for Value based timing-path node
 using TimingPathNodeOp = TimingPathNode<Value>;
 
+
+// extract the port name associated with \p val assuming
+// it is a block argument
 StringRef getModulePortName(Value val) {
   assert(isBlockArgument(val) && "val must be a BlockArgument in getModulePortName");
   FModuleOp module = cast<FModuleOp>(val.cast<BlockArgument>().getOwner()->getParentOp());
@@ -164,11 +177,16 @@ template<> bool TimingPathNodeOp::isPathTerminationNode(){
   return isPathTerminationValue(nodeOp);
 }
 
+
+// Class to store a complete timing-path
 class TimingPath {
 public:
+  // path starting node
   TimingPathNodeOp* startPoint;
+  // path finish node
   TimingPathNodeOp* endPoint;
   double latency;
+  // list of path nodes from start to finish
   std::list<TimingPathNodeOp*> nodes;
   TimingPath(TimingPathNodeOp* node, ModuleTimingInfo* moduleTimingInfo) {
     endPoint = node->getPathLastNode();
@@ -209,25 +227,35 @@ public:
     }
   }
 
+  // check if this path start at a module input
   bool startAtInput() {
     return isBlockArgument(startPoint->nodeOp) && foldFlow(startPoint->nodeOp) == Flow::Source;
   }
+
+  // check if this path start at a module register
   bool startAtRegister() {
     return isRegister(startPoint->nodeOp);
   }
+
+  // check if this module ends at a module output
   bool endAtOutput() {
     // todo: output may also be Flow::Duplex if they are re-used as expression source
     // in the same module
     return isBlockArgument(endPoint->nodeOp) && foldFlow(endPoint->nodeOp) == Flow::Sink;
   }
+
+  // check if this module ends at a module register
   bool endAtRegister() {
     return isRegister(endPoint->nodeOp);
   }
 
+  // return the starting label of the path (if any)
   StringRef startLabel() {
     if (startAtRegister()) return "<register>";
     else return getModulePortName(startPoint->nodeOp);
   }
+
+  // return the finish label of the path (if any)
   StringRef endLabel() {
     if (endAtRegister()) return "<register>";
     else return getModulePortName(endPoint->nodeOp);
@@ -303,6 +331,7 @@ StringRef getModuleNameFromInfo(ModuleTimingInfo* moduleInfo) {
   return moduleInfo->module.getName();
 }
 
+// Map of timing info on multiple modules
 class MapModuleTimingInfo {
 public:
   DenseMap<StringRef, ModuleTimingInfo*> moduleMap;
@@ -507,6 +536,8 @@ bool isOutputValue(Value val) {
 
 
 
+// Specialization of FIRRTLVisitor to visit all the operation nodes
+// and evaluate latency node by node
 struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
   public:
     // llvm::DenseMap<Operation, double> opsLatency;
@@ -808,6 +839,11 @@ void CriticalPathAnalysisPass::runOnOperation() {
   });
 
 
+  // Depending on the order of operations during the initial list traversal
+  // some operations timing may not have been determined, and we may need
+  // to traverse the list of remaining (undetermined) nodes
+  //
+  // todo: check invariant in circt's FIRRTL operation order
   while (!worklist.empty()) {
     Operation* op = worklist.front();
     LLVM_DEBUG(llvm::dbgs()
