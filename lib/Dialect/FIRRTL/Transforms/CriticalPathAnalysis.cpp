@@ -53,6 +53,17 @@ bool isRegister(Value val) {
     .Default([](auto) { return false;});
 }
 
+// test if <val> is a constant operation (directly only)
+bool isConstant(Value val) {
+  if (!val) return false;
+  Operation* op = val.getDefiningOp();
+  if (!op)
+    return false;
+  return TypeSwitch<Operation *, bool>(op)
+    .Case<ConstantOp>([](auto) { return true;})
+    .Default([](auto) { return false;});
+}
+
 // predicate testing if an op can be discarded while building critical paths
 bool discardableOp(Operation* op) {
   return TypeSwitch<Operation *, bool>(op)
@@ -92,13 +103,18 @@ class TimingPathNode {
     // pointer towards the module where this path is located
     ModuleTimingInfo* moduleTimingInfo;
 
+    // the timing path up to and including this node is only involving
+    // constant nodes and operations on recursive constants
+    // and thus should not be prioritized when building a critical-path
+    bool constant;
+
     TimingPathNode(): nodeLatency(0.0), nodeOp(nullptr), resultIndex(-1), previousNode(nullptr),
-                      nextNode(nullptr), pathLatency(0.0), moduleTimingInfo(nullptr) {}
+                      nextNode(nullptr), pathLatency(0.0), moduleTimingInfo(nullptr), constant(false) {}
 
     TimingPathNode(TimingPathNode& _rvalue) = default;
 
-    TimingPathNode(double latency, T op, TimingPathNode<T>* previous, int index=0, ModuleTimingInfo* _module=nullptr):
-      nodeLatency(latency), resultIndex(index), previousNode(previous), nextNode(nullptr), moduleTimingInfo(_module) {
+    TimingPathNode(double latency, T op, TimingPathNode<T>* previous, int index=0, ModuleTimingInfo* _module=nullptr, bool cst=false):
+      nodeLatency(latency), resultIndex(index), previousNode(previous), nextNode(nullptr), moduleTimingInfo(_module), constant(cst) {
         nodeOp = op;
         pathLatency = (previous ? previousNode->pathLatency : 0.0) + nodeLatency;
         if (previous) previous->nextNode = this;
@@ -237,6 +253,12 @@ public:
     return isRegister(startPoint->nodeOp);
   }
 
+  // check if this path start at a constant
+  // todo: this should not happen, path starting at constant should be discarded
+  bool startAtConstant() {
+    return isConstant(startPoint->nodeOp);
+  }
+
   // check if this module ends at a module output
   bool endAtOutput() {
     // todo: output may also be Flow::Duplex if they are re-used as expression source
@@ -252,6 +274,7 @@ public:
   // return the starting label of the path (if any)
   StringRef startLabel() {
     if (startAtRegister()) return "<register>";
+    if (startAtConstant()) return "<constant>";
     else return getModulePortName(startPoint->nodeOp);
   }
 
@@ -576,7 +599,7 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
 
     // constant operation have zero-latency
     bool visitExpr(ConstantOp op) {
-      valuesLatency[op->getOpResult(0)] = new TimingPathNodeOp(0.0, op->getOpResult(0), nullptr);
+      valuesLatency[op->getOpResult(0)] = new TimingPathNodeOp(0.0, op->getOpResult(0), nullptr, true /* constant */);
       return true;
      }
 
@@ -607,7 +630,7 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
         TimingPathNodeOp* prePath = getStoredLatency(operand);
         if (!prePath) return false;
         double operandLatency = prePath->pathLatency;
-        if (nullptr == longestPath || operandLatency > longestPath->pathLatency)
+        if (nullptr == longestPath || operandLatency > longestPath->pathLatency || longestPath->constant)
           longestPath = prePath;
       }
       valuesLatency[op->getOpResult(0)] = new TimingPathNodeOp(opClassLatency, op->getOpResult(0), longestPath);
