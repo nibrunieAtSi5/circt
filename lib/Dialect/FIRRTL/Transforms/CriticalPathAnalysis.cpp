@@ -312,7 +312,7 @@ class ModuleTimingInfo {
 
     ModulePathTimingInfo* getPathFromOutput(StringRef portName) {
       for (auto label_path : pathFromOutput) {
-        llvm::outs() << "label_path.first=" << label_path.first.str() << " portName.str=" << portName.str() << "\n";
+        LLVM_DEBUG(llvm::dbgs() << "label_path.first=" << label_path.first.str() << " portName.str=" << portName.str() << "\n");
         if (label_path.first.str() == portName.str()) return label_path.second;
       }
       return nullptr;
@@ -322,7 +322,8 @@ class ModuleTimingInfo {
     void registerOutputPath(llvm::SmallVector<TimingPathNodeOp*> &pathVector) {
       for (auto pathEnd: pathVector) {
         TimingPath localPath(pathEnd, this);
-        llvm::outs() << "registering path for module " << module.getName() << " ending at " << localPath.endLabel() << " " << localPath.endAtOutput() << "\n";
+        LLVM_DEBUG(llvm::dbgs()
+                    << "registering path for module " << module.getName() << " ending at " << localPath.endLabel() << " " << localPath.endAtOutput() << "\n");
         if (localPath.endAtOutput()) {
           pathFromOutput[localPath.endLabel()] = new ModulePathTimingInfo(localPath.startLabel(), localPath.endLabel(), localPath);
         }
@@ -695,7 +696,8 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
             valuesLatency[val] = inputPath;
             return inputPath;
         }
-        llvm::outs() << "could not find latency for Value " << val << " defined here: " << val.getDefiningOp() << "\n";
+      LLVM_DEBUG(llvm::dbgs()
+                 << "could not find latency for Value " << val << " defined here: " << val.getDefiningOp() << "\n");
         return nullptr;
       }
       return node;
@@ -718,14 +720,14 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
       TimingPathNodeOp *localPath = new TimingPathNodeOp(0.0, destOp, path);
       valuesLatency[destOp] = localPath;
       if (isOutputValue(destOp)) {
-        llvm::outs() << "found connection to output ";
-        destOp.print(llvm::outs());
-        llvm::outs() << ".\n";
+        LLVM_DEBUG(llvm::dbgs() << "found connection to output ");
+        LLVM_DEBUG(destOp.print(llvm::dbgs()););
+        LLVM_DEBUG(llvm::dbgs() << ".\n");
         outputPaths.push_back(localPath);
       } else if (isRegister(destOp)) {
-        llvm::outs() << "found connection to register ";
-        destOp.print(llvm::outs());
-        llvm::outs() << ".\n";
+        LLVM_DEBUG(llvm::dbgs() << "found connection to register ");
+        LLVM_DEBUG(destOp.print(llvm::dbgs()););
+        LLVM_DEBUG(llvm::dbgs() << ".\n");
         toRegPaths.push_back(localPath);
       }
       return true;
@@ -736,15 +738,15 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
     }
 
     bool visitDecl(RegOp op){
-      llvm::outs() << "declaring register ";
-      op.result().print(llvm::outs());
-      llvm::outs() << ".\n";
+      LLVM_DEBUG( llvm::dbgs() << "declaring register ";
+        op.result().print(llvm::dbgs());
+        llvm::dbgs() << ".\n");
       valuesLatency[op.result()] = new TimingPathNodeOp(0.0, op.result(), nullptr);
       return true;
     }
 
     bool visitDecl(InstanceOp op){
-      llvm::outs() << "visiting module instance\n";
+      LLVM_DEBUG(llvm::dbgs() << "visiting module instance\n");
       // lookup if module's critical paths have already been evaluated
       ModuleTimingInfo* moduleTimingInfo = moduleMap->getModuleTimingInfoByName(op.moduleName());
       if (!moduleTimingInfo) {
@@ -824,7 +826,8 @@ void CriticalPathAnalysisPass::runOnOperation() {
   // port name, so we just point at the module with the port name mentioned in
   // the error.
   for (auto &port : module.getPorts()) {
-    llvm::outs() << "Port " << port.getName() << " of type " << port.type << " isOutput " << port.isOutput() << "\n";
+    LLVM_DEBUG(llvm::dbgs()
+               << "Port " << port.getName() << " of type " << port.type << " isOutput " << port.isOutput() << "\n");
   }
 
   auto latencyEvaluator = ExprLatencyEvaluator(&moduleInfo, &moduleMap);
@@ -900,7 +903,8 @@ void CriticalPathAnalysisPass::runOnOperation() {
   moduleTiming->registerOutputPath(latencyEvaluator.outputPaths);
   moduleTiming->registerPathToRegs(latencyEvaluator.toRegPaths);
   moduleTiming->displayPaths(true);
-  llvm::outs() << "register module timing info for " << module.getName() << "\n";
+  LLVM_DEBUG(llvm::dbgs()
+             << "register module timing info for " << module.getName() << "\n");
   moduleMap.registerModuleTimingInfo(module.getName(), moduleTiming);
 
   // register's module critical path
