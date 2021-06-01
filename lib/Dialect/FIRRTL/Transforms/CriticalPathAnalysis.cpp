@@ -183,6 +183,8 @@ template<> void TimingPathNodeOp::print(raw_ostream& stream, bool displayLoc) {
   if (nodeOp) {
      if (isBlockArgument(nodeOp)) {
        stream << getModulePortName(nodeOp);
+     } else if (isRegister(nodeOp)) {
+       stream << "Reg<" << nodeOp.getDefiningOp()->getAttrOfType<StringAttr>("name") << ">";
      } else nodeOp.getDefiningOp()->emitRemark("CP step"); // print(llvm::outs());
     if (displayLoc) stream << " " << nodeOp.getLoc();
     stream << "\n";
@@ -838,7 +840,6 @@ void CriticalPathAnalysisPass::runOnOperation() {
   std::list<Operation*> worklist;
 
   // temporary determined critical path end node
-  TimingPathNodeOp* criticalPathEnd = nullptr;
 
   // Check the results of each operation.
   module->walk([&](Operation *op) {
@@ -855,21 +856,15 @@ void CriticalPathAnalysisPass::runOnOperation() {
     // enqueue operations for which latency was not determined
     if (!latencyFound)
       worklist.push_back(op);
-    else {
-      auto& path = latencyEvaluator.valuesLatency[op->getOpResult(0)];
-      if (!path) {
-        if (nullptr == criticalPathEnd || criticalPathEnd->pathLatency < path->pathLatency)
-        criticalPathEnd = path;
-        LLVM_DEBUG(llvm::dbgs()
-                  << "Found latency " << path->pathLatency << " for op " << op->getName().getStringRef().str() << "\n");
-      }
-    }
   });
 
 
   // Depending on the order of operations during the initial list traversal
   // some operations timing may not have been determined, and we may need
   // to traverse the list of remaining (undetermined) nodes
+  //
+  // the nodes must be processed in a topological order from input/reg-out to
+  // output/reg-in
   //
   // todo: check invariant in circt's FIRRTL operation order
   while (!worklist.empty()) {
