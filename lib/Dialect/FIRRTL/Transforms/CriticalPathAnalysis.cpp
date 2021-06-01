@@ -765,8 +765,15 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
         // input
         auto inputPath = getStoredLatency(op->getOpResult(portIdx));
         if (!inputPath) {
-          llvm::outs() << "latency for input" << port.name << " of module " << op.moduleName() << " has not been determined yet.\n";
-          return false;
+          if (port.getName() == "clock" || port.getName() == "reset") {
+            llvm::outs() << "specific port" << port.name << " of module " << op.moduleName() << " with zero latency found.\n";
+            Value val = op->getOpResult(portIdx);
+            inputPath = new TimingPathNodeOp(0.0, val, nullptr);
+            valuesLatency[val] = inputPath;
+          } else {
+            llvm::outs() << "latency for input " << port.name << " of module " << op.moduleName() << " has not been determined yet.\n";
+            return false;
+          }
         }
         latencyByPortName[port.getName()] = inputPath;
       }
