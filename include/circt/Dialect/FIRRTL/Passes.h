@@ -41,7 +41,7 @@ std::unique_ptr<mlir::Pass>
 createBlackBoxReaderPass(llvm::Optional<StringRef> inputPrefix = {},
                          llvm::Optional<StringRef> resourcePrefix = {});
 
-std::unique_ptr<mlir::Pass> createCriticalPathAnalysisPass();
+std::unique_ptr<mlir::Pass> createCriticalPathAnalysisPass(llvm::Optional<bool> displayLoc = {});
 
 /// Generate the code for registering passes.
 #define GEN_PASS_REGISTRATION

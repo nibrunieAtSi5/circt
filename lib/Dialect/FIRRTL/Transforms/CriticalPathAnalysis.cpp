@@ -805,6 +805,8 @@ class CriticalPathAnalysisPass : public CriticalPathAnalysisBase<CriticalPathAna
   void runOnOperation() override;
 
   MapModuleTimingInfo moduleMap;
+public:
+  bool displayLoc;
 };
 } // namespace
 
@@ -902,7 +904,7 @@ void CriticalPathAnalysisPass::runOnOperation() {
   // critical path traversal
   moduleTiming->registerOutputPath(latencyEvaluator.outputPaths);
   moduleTiming->registerPathToRegs(latencyEvaluator.toRegPaths);
-  moduleTiming->displayPaths(true);
+  moduleTiming->displayPaths(displayLoc);
   LLVM_DEBUG(llvm::dbgs()
              << "register module timing info for " << module.getName() << "\n");
   moduleMap.registerModuleTimingInfo(module.getName(), moduleTiming);
@@ -922,7 +924,12 @@ void CriticalPathAnalysisPass::runOnOperation() {
 }
 
 
-std::unique_ptr<mlir::Pass> circt::firrtl::createCriticalPathAnalysisPass() {
-  return std::make_unique<CriticalPathAnalysisPass>();
+std::unique_ptr<mlir::Pass> circt::firrtl::createCriticalPathAnalysisPass(llvm::Optional<bool> displayLoc) {
+  auto pass = std::make_unique<CriticalPathAnalysisPass>();
+  // debug
+  if (displayLoc) {
+    pass->displayLoc = displayLoc.getValue();
+  }
+  return pass;
 }
 

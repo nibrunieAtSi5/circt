@@ -180,6 +180,11 @@ def CriticalPathAnalysis : Pass<"firrtl-analyze-critical-path", "firrtl::FModule
     This pass analyzes a FIRRTL module to determine its critical path.
   }];
   let constructor = "circt::firrtl::createCriticalPathAnalysisPass()";
+  let options = [
+    Option<"displayLoc", "display-loc", "bool", "false",
+      "Enable the display of source code location associated with timing "
+      "path nodes.">,
+  ];
 }
 
 #endif // CIRCT_DIALECT_FIRRTL_PASSES_TD
