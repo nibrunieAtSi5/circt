@@ -191,6 +191,7 @@ template<> void TimingPathNodeOp::print(raw_ostream& stream, bool displayLoc) {
   }
 }
 
+// Predicate: can this node correspond to a path start/end
 template<> bool TimingPathNodeOp::isPathTerminationNode(){
   return isPathTerminationValue(nodeOp);
 }
@@ -222,6 +223,9 @@ public:
     latency = endPoint->pathLatency;
   }
 
+  /** Display a timing path on \p stream
+   *  if \p displayLoc is enabled then display original source code location (if present)
+   */
   void print(raw_ostream& stream, bool displayLoc=false) {
     int index = 0;
     stream << "critical path:\n";
@@ -287,10 +291,14 @@ public:
   }
 };
 
+/** Summary of a full timing path */
 class ModulePathTimingInfo {
 public:
+  // start label
   StringRef startLabel;
+  // end label
   StringRef endLabel;
+  // detail of timing path
   TimingPath path;
 
   ModulePathTimingInfo() = default;
@@ -301,17 +309,25 @@ public:
     startLabel(startLabel), endLabel(endLabel), path(_path) {}
 };
 
+
+/** Timing information for a specific module */
 class ModuleTimingInfo {
   public:
+    // reference of associated module
     FModuleOp module;
+    // I/O port info for the local module
     SmallVector<ModulePortInfo, 8> portInfo;
+    // map of timing-path addressed by output port (path's end)
+    llvm::DenseMap<StringRef, ModulePathTimingInfo*> pathFromOutput;
+    // list of critical path which ends in a register
+    llvm::SmallVector<TimingPath> pathToRegs;
+
     ModuleTimingInfo(FModuleOp mod) : module(mod) {
       portInfo = getModulePortInfo(mod);
     }
-    // llvm::DenseMap<StringRef, ModulePathTimingInfo> pathFromStart; -> no unicity of critical-path seen from start point
-    llvm::DenseMap<StringRef, ModulePathTimingInfo*> pathFromOutput;
-    llvm::SmallVector<TimingPath> pathToRegs;
 
+
+    // return a path summary from a given output port
     ModulePathTimingInfo* getPathFromOutput(StringRef portName) {
       for (auto label_path : pathFromOutput) {
         LLVM_DEBUG(llvm::dbgs() << "label_path.first=" << label_path.first.str() << " portName.str=" << portName.str() << "\n");
@@ -340,6 +356,8 @@ class ModuleTimingInfo {
       }
     }
 
+    // display on llvm::outs() a summary of the critical paths listed
+    // for this module
     void displayPaths(bool displayLoc=false) {
         llvm::outs() << "Critical path for module" << module.getName() << "\n";
         llvm::outs() << "== path from output" << module.getName() << "\n";
@@ -353,6 +371,7 @@ class ModuleTimingInfo {
     }
 };
 
+/** return the name of the local module of \p moduleInfo */
 StringRef getModuleNameFromInfo(ModuleTimingInfo* moduleInfo) {
   return moduleInfo->module.getName();
 }
@@ -360,12 +379,15 @@ StringRef getModuleNameFromInfo(ModuleTimingInfo* moduleInfo) {
 // Map of timing info on multiple modules
 class MapModuleTimingInfo {
 public:
+  // map associated a name to timing info for the module with this name
   DenseMap<StringRef, ModuleTimingInfo*> moduleMap;
 
   // todo: clean bad memory management: moduleTimingInfo is allocated somewhere and never free-ed
   void registerModuleTimingInfo(StringRef moduleName, ModuleTimingInfo* moduleTimingInfo) {
     moduleMap[moduleName] = moduleTimingInfo;
   }
+
+  /** return the timing info associated to a module whose name is \p moduleName */
   ModuleTimingInfo* getModuleTimingInfoByName(StringRef moduleName) {
     return moduleMap[moduleName];
   }
