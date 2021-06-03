@@ -93,6 +93,8 @@ class TimingPathNode {
     T nodeOp;
     // index of Value/OpResult in nodeOp corresponding to local value
     int resultIndex;
+    // index of bit from Value associated with this timing path
+    int bitIndex;
     /// pointer to previous node (upstream) in the critical path
     TimingPathNode<T> *previousNode;
     /// pointer to the next node (downstream) in the critical path
@@ -108,13 +110,21 @@ class TimingPathNode {
     // and thus should not be prioritized when building a critical-path
     bool constant;
 
-    TimingPathNode(): nodeLatency(0.0), nodeOp(nullptr), resultIndex(-1), previousNode(nullptr),
+    TimingPathNode(): nodeLatency(0.0), nodeOp(nullptr), resultIndex(-1), bitIndex(-1), previousNode(nullptr),
                       nextNode(nullptr), pathLatency(0.0), moduleTimingInfo(nullptr), constant(false) {}
 
     TimingPathNode(TimingPathNode& _rvalue) = default;
 
-    TimingPathNode(double latency, T op, TimingPathNode<T>* previous, int index=0, ModuleTimingInfo* _module=nullptr, bool cst=false):
-      nodeLatency(latency), resultIndex(index), previousNode(previous), nextNode(nullptr), moduleTimingInfo(_module), constant(cst) {
+    TimingPathNode(double latency, T op, TimingPathNode<T>* previous, int index=0, ModuleTimingInfo* _module=nullptr, bool cst=false, int _bitIndex=-1):
+      nodeLatency(latency), resultIndex(index), bitIndex(_bitIndex), previousNode(previous), nextNode(nullptr), moduleTimingInfo(_module), constant(cst) {
+        nodeOp = op;
+        pathLatency = (previous ? previousNode->pathLatency : 0.0) + nodeLatency;
+        if (previous) previous->nextNode = this;
+    }
+
+    // reduced version of constructor
+    TimingPathNode(double latency, T op, TimingPathNode<T>* previous, bool cst, int _bitIndex):
+      nodeLatency(latency), resultIndex(0), bitIndex(_bitIndex), previousNode(previous), nextNode(nullptr), moduleTimingInfo(nullptr), constant(cst) {
         nodeOp = op;
         pathLatency = (previous ? previousNode->pathLatency : 0.0) + nodeLatency;
         if (previous) previous->nextNode = this;
@@ -328,7 +338,7 @@ class ModuleTimingInfo {
 
 
     // return a path summary from a given output port
-    ModulePathTimingInfo* getPathFromOutput(StringRef portName) {
+    ModulePathTimingInfo* getPathFromOutput(StringRef portName, int bitIndex) {
       for (auto label_path : pathFromOutput) {
         LLVM_DEBUG(llvm::dbgs() << "label_path.first=" << label_path.first.str() << " portName.str=" << portName.str() << "\n");
         if (label_path.first.str() == portName.str()) return label_path.second;
@@ -589,7 +599,7 @@ bool isOutputValue(Value val) {
 struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
   public:
     // llvm::DenseMap<Operation, double> opsLatency;
-    llvm::DenseMap<Value, TimingPathNodeOp*> valuesLatency;
+    llvm::DenseMap<std::pair<Value, int>, TimingPathNodeOp*> valuesLatency;
     llvm::SmallVector<TimingPathNodeOp*> outputPaths;
     llvm::SmallVector<TimingPathNodeOp*> fromRegPaths;
     llvm::SmallVector<TimingPathNodeOp*> toRegPaths;
@@ -624,7 +634,8 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
 
     // constant operation have zero-latency
     bool visitExpr(ConstantOp op) {
-      valuesLatency[op->getOpResult(0)] = new TimingPathNodeOp(0.0, op->getOpResult(0), nullptr, true /* constant */);
+      for (int bitIndex = 0; bitIndex < getResultWidth(op); bitIndex++)
+        valuesLatency[std::make_pair(op->getOpResult(0), bitIndex)] = new TimingPathNodeOp(0.0, op->getOpResult(0), nullptr, true /* constant */, bitIndex);
       return true;
      }
 
@@ -637,40 +648,111 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
       if (isInputValue(input)) {
 
       } else {
-        TimingPathNodeOp* prePath = getStoredLatency(input);
+        TimingPathNodeOp* prePath = getStoredLatency(input, 0); // todo/fixme forcing bit index 0 in input
         if (prePath) return false;
         previous = prePath;
       }
-      TimingPathNodeOp* pathNode = new TimingPathNodeOp(0.0, op->getOpResult(0), previous);
-      LLVM_DEBUG(llvm::dbgs()
-                << "Inner Found latency " << pathNode->pathLatency << " for op " << op->getName().getStringRef().str() << "\n");
-      valuesLatency[op->getOpResult(0)] = pathNode;
+      for (int bitIndex = 0; bitIndex < getResultWidth(op); bitIndex++)  {
+        TimingPathNodeOp* pathNode = new TimingPathNodeOp(0.0, op->getOpResult(0), previous, false, bitIndex);
+        LLVM_DEBUG(llvm::dbgs()
+                  << "Inner Found latency " << pathNode->pathLatency << " for op " << op->getName().getStringRef().str() << "\n");
+        valuesLatency[std::make_pair(op->getOpResult(0), bitIndex)] = pathNode;
+      }
       return true;
     }
 
     // visit generic multi-ary bitwise operation (e.g. Xor, And ...)
+    // we assume all the operands have the same size
     bool visitMultiAryBitwiseOp(Operation* op, const double opClassLatency) {
+      for (int bitIndex = 0; bitIndex < getResultWidth(op); bitIndex++)  {
+        TimingPathNodeOp* longestPath = nullptr;
+        for (auto operand: op->getOperands()) {
+          TimingPathNodeOp* prePath = getStoredLatency(operand, bitIndex);
+          if (!prePath) return false;
+          double operandLatency = prePath->pathLatency;
+          if (nullptr == longestPath || operandLatency > longestPath->pathLatency || longestPath->constant)
+            longestPath = prePath;
+        }
+        valuesLatency[std::make_pair(op->getOpResult(0), bitIndex)] = new TimingPathNodeOp(opClassLatency, op->getOpResult(0), longestPath, false, bitIndex);
+      }
+      return true;
+    }
+
+    // visit multi-ary reduction operation
+    bool visitMultiAryReductionOp(Operation* op, const double opClassLatency) {
       TimingPathNodeOp* longestPath = nullptr;
       for (auto operand: op->getOperands()) {
-        TimingPathNodeOp* prePath = getStoredLatency(operand);
+        for (int bitIndex = 0; bitIndex < getWidth(operand.getType()); bitIndex++)  {
+          TimingPathNodeOp* prePath = getStoredLatency(operand, bitIndex);
+          if (!prePath) return false;
+          double operandLatency = prePath->pathLatency;
+          if (nullptr == longestPath || operandLatency > longestPath->pathLatency || longestPath->constant)
+            longestPath = prePath;
+        }
+      }
+      valuesLatency[std::make_pair(op->getOpResult(0), 0)] = new TimingPathNodeOp(opClassLatency, op->getOpResult(0), longestPath, false, 0 /* bit index */);
+      return true;
+    }
+
+    // visit unary reduction operation
+    bool visitReductionOp(Operation* op, const double opClassLatency) {
+      Value input = op->getOperand(0);
+      TimingPathNodeOp* longestPath = nullptr;
+      for (int bitIndex = 0; bitIndex < getWidth(input.getType()); bitIndex++)  {
+        TimingPathNodeOp* prePath = getStoredLatency(input, bitIndex);
         if (!prePath) return false;
         double operandLatency = prePath->pathLatency;
         if (nullptr == longestPath || operandLatency > longestPath->pathLatency || longestPath->constant)
           longestPath = prePath;
       }
-      valuesLatency[op->getOpResult(0)] = new TimingPathNodeOp(opClassLatency, op->getOpResult(0), longestPath);
+      valuesLatency[std::make_pair(op->getOpResult(0), 0)] = new TimingPathNodeOp(opClassLatency, op->getOpResult(0), longestPath, false, 0 /* bit index */);
       return true;
-
     }
 
+    bool visitMuxOp(MuxPrimOp op, double opClassLatency) {
+      // initialize longest path with sel signal
+      TimingPathNodeOp* selPath = getStoredLatency(op.sel(), 0);
+      if (!selPath) return false;
+      double operandLatency = selPath->pathLatency;
+      TimingPathNodeOp* longestPath = nullptr;
+      // bitwise processing
+      for (int bitIndex = 0; bitIndex < getResultWidth(op); bitIndex++)  {
+        TimingPathNodeOp* longestPath = selPath;
+        TimingPathNodeOp* prePath = getStoredLatency(op.high(), bitIndex);
+        if (!prePath) return false;
+        double operandLatency = prePath->pathLatency;
+        if (nullptr == longestPath || operandLatency > longestPath->pathLatency || longestPath->constant)
+          longestPath = prePath;
+        prePath = getStoredLatency(op.low(), bitIndex);
+        if (!prePath) return false;
+        operandLatency = prePath->pathLatency;
+        if (nullptr == longestPath || operandLatency > longestPath->pathLatency || longestPath->constant)
+          longestPath = prePath;
+        valuesLatency[std::make_pair(op->getOpResult(0), bitIndex)] = new TimingPathNodeOp(opClassLatency, op->getOpResult(0), longestPath, false, bitIndex);
+      }
+      return true;
+    }
+
+    bool visitCatOp(CatPrimOp op, double opClassLatency) {
+      int fullWidth = getResultWidth(op);
+      for (auto operand: op->getOperands()) {
+        fullWidth -= getResultWidth(op);
+        for (int bitIndex = 0; bitIndex < getResultWidth(op); bitIndex++)  {
+          TimingPathNodeOp* prePath = getStoredLatency(operand, bitIndex);
+          if (!prePath) return false;
+          valuesLatency[std::make_pair(op->getOpResult(0), bitIndex + fullWidth)] = new TimingPathNodeOp(opClassLatency, op->getOpResult(0), prePath, false, bitIndex + fullWidth);
+        }
+      }
+      return true;
+    }
 
     bool visitExpr(XorPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
     bool visitExpr(AndPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
     bool visitExpr(OrPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
 
-    bool visitExpr(AndRPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
-    bool visitExpr(OrRPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
-    bool visitExpr(XorRPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
+    bool visitExpr(AndRPrimOp op) { return visitReductionOp(op, TimingModel::getOpLatency(op)); }
+    bool visitExpr(OrRPrimOp op)  { return visitReductionOp(op, TimingModel::getOpLatency(op)); }
+    bool visitExpr(XorRPrimOp op) { return visitReductionOp(op, TimingModel::getOpLatency(op)); }
 
     bool visitExpr(NotPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
 
@@ -683,41 +765,43 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
     bool visitExpr(DShrPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
     bool visitExpr(DShlPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
 
-    bool visitExpr(EQPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
-    bool visitExpr(NEQPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
+    bool visitExpr(EQPrimOp op)  { return visitMultiAryReductionOp(op, TimingModel::getOpLatency(op)); }
+    bool visitExpr(NEQPrimOp op) { return visitMultiAryReductionOp(op, TimingModel::getOpLatency(op)); }
+    bool visitExpr(LTPrimOp op)  { return visitMultiAryReductionOp(op, TimingModel::getOpLatency(op)); }
+    bool visitExpr(LEQPrimOp op) { return visitMultiAryReductionOp(op, TimingModel::getOpLatency(op)); }
+    bool visitExpr(GTPrimOp op)  { return visitMultiAryReductionOp(op, TimingModel::getOpLatency(op)); }
+    bool visitExpr(GEQPrimOp op) { return visitMultiAryReductionOp(op, TimingModel::getOpLatency(op)); }
 
-    bool visitExpr(LTPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
-    bool visitExpr(LEQPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
-    bool visitExpr(GTPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
-    bool visitExpr(GEQPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
-
-    bool visitExpr(CvtPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
-    bool visitExpr(AsSIntPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
-    bool visitExpr(AsUIntPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
-    bool visitExpr(AsPassivePrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
+    bool visitExpr(CvtPrimOp op)          { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
+    bool visitExpr(AsSIntPrimOp op)       { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
+    bool visitExpr(AsUIntPrimOp op)       { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
+    bool visitExpr(AsPassivePrimOp op)    { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
     bool visitExpr(AsNonPassivePrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
 
     bool visitExpr(PadPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
 
-    bool visitExpr(CatPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
-    bool visitExpr(MuxPrimOp op) { return visitMultiAryBitwiseOp(op, TimingModel::getOpLatency(op)); }
+    bool visitExpr(CatPrimOp op) { return visitCatOp(op, TimingModel::getOpLatency(op)); }
+    bool visitExpr(MuxPrimOp op) { return visitMuxOp(op, TimingModel::getOpLatency(op)); }
 
     bool visitExpr(BitsPrimOp op) {
-      TimingPathNodeOp* prePath = getStoredLatency(op.input());
-      // todo: for now we discard the effect of the selection range
-      if (!prePath) return false;
-      TimingPathNodeOp* localPath = new TimingPathNodeOp(0.0, op->getOpResult(0), prePath);
-      valuesLatency[op->getOpResult(0)] = localPath;
+      for (int bitIndex = op.lo(); bitIndex <= op.hi(); bitIndex++) {
+        int localBitIndex = bitIndex - op.lo();
+        TimingPathNodeOp* prePath = getStoredLatency(op.input(), bitIndex);
+        // todo: for now we discard the effect of the selection range
+        if (!prePath) return false;
+        TimingPathNodeOp* localPath = new TimingPathNodeOp(0.0, op->getOpResult(0), prePath, false /* cst */, localBitIndex);
+        valuesLatency[std::make_pair(op->getOpResult(0), localBitIndex)] = localPath;
+      }
       return true;
     }
 
     // todo: should use Option-like mechanism to return both path and success flag rather (than inout arg)
-    TimingPathNodeOp* getStoredLatency(Value val) {
-      auto &node = valuesLatency[val];
+    TimingPathNodeOp* getStoredLatency(Value val, int bitIndex) {
+      auto &node = valuesLatency[std::make_pair(val, bitIndex)];
       if (!node || node->pathLatency < 0) {
         if (isInputValue(val)) {
-            TimingPathNodeOp* inputPath = new TimingPathNodeOp(0.0, val, nullptr);
-            valuesLatency[val] = inputPath;
+            TimingPathNodeOp* inputPath = new TimingPathNodeOp(0.0, val, nullptr, false /** cst */, bitIndex);
+            valuesLatency[std::make_pair(val, bitIndex)] = inputPath;
             return inputPath;
         }
       LLVM_DEBUG(llvm::dbgs()
@@ -731,28 +815,30 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
       Value srcOp;
       if (isWire(op.src())) srcOp = getWireValue(op.src());
       else srcOp = op.src();
-      TimingPathNodeOp* path = getStoredLatency(srcOp);
-      if (!path) return false;
-      Value destOp;
-      if (isWire(op.dest())) {
-        // we squeeze wire as a single Value
-        // todo: optimize by field
-        destOp = getWireValue(op.dest());
-      } else {
-        destOp = op.dest();
-      }
-      TimingPathNodeOp *localPath = new TimingPathNodeOp(0.0, destOp, path);
-      valuesLatency[destOp] = localPath;
-      if (isOutputValue(destOp)) {
-        LLVM_DEBUG(llvm::dbgs() << "found connection to output ");
-        LLVM_DEBUG(destOp.print(llvm::dbgs()););
-        LLVM_DEBUG(llvm::dbgs() << ".\n");
-        outputPaths.push_back(localPath);
-      } else if (isRegister(destOp)) {
-        LLVM_DEBUG(llvm::dbgs() << "found connection to register ");
-        LLVM_DEBUG(destOp.print(llvm::dbgs()););
-        LLVM_DEBUG(llvm::dbgs() << ".\n");
-        toRegPaths.push_back(localPath);
+      for (int bitIndex=0; bitIndex < getResultWidth(op); bitIndex++) {
+        TimingPathNodeOp* path = getStoredLatency(srcOp, bitIndex);
+        if (!path) return false;
+        Value destOp;
+        if (isWire(op.dest())) {
+          // we squeeze wire as a single Value
+          // todo: optimize by field
+          destOp = getWireValue(op.dest());
+        } else {
+          destOp = op.dest();
+        }
+        TimingPathNodeOp *localPath = new TimingPathNodeOp(0.0, destOp, path, false /* cst */, bitIndex);
+        valuesLatency[std::make_pair(destOp, bitIndex)] = localPath;
+        if (isOutputValue(destOp)) {
+          LLVM_DEBUG(llvm::dbgs() << "found connection to output ");
+          LLVM_DEBUG(destOp.print(llvm::dbgs()););
+          LLVM_DEBUG(llvm::dbgs() << ".\n");
+          outputPaths.push_back(localPath);
+        } else if (isRegister(destOp)) {
+          LLVM_DEBUG(llvm::dbgs() << "found connection to register ");
+          LLVM_DEBUG(destOp.print(llvm::dbgs()););
+          LLVM_DEBUG(llvm::dbgs() << ".\n");
+          toRegPaths.push_back(localPath);
+        }
       }
       return true;
     }
@@ -765,7 +851,9 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
       LLVM_DEBUG( llvm::dbgs() << "declaring register ";
         op.result().print(llvm::dbgs());
         llvm::dbgs() << ".\n");
-      valuesLatency[op.result()] = new TimingPathNodeOp(0.0, op.result(), nullptr);
+      for (int bitIndex = 0; bitIndex < getResultWidth(op); bitIndex++)  {
+        valuesLatency[std::make_pair(op.result(), bitIndex)] = new TimingPathNodeOp(0.0, op.result(), nullptr, false /* cst */, bitIndex);
+      }
       return true;
     }
 
@@ -785,19 +873,23 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
         auto port = moduleTimingInfo->portInfo[portIdx];
         if (port.isOutput()) continue;
         // input
-        auto inputPath = getStoredLatency(op->getOpResult(portIdx));
-        if (!inputPath) {
-          if (port.getName() == "clock" || port.getName() == "reset") {
-            llvm::outs() << "specific port" << port.name << " of module " << op.moduleName() << " with zero latency found.\n";
-            Value val = op->getOpResult(portIdx);
-            inputPath = new TimingPathNodeOp(0.0, val, nullptr);
-            valuesLatency[val] = inputPath;
-          } else {
-            llvm::outs() << "latency for input " << port.name << " of module " << op.moduleName() << " has not been determined yet.\n";
-            return false;
+        auto portValue = op->getOpResult(portIdx);
+        for (int bitIndex = 0; bitIndex < getWidth(portValue.getType()); bitIndex++)  {
+          auto inputPath = getStoredLatency(portValue, bitIndex);
+          if (!inputPath) {
+            if (port.getName() == "clock" || port.getName() == "reset") {
+              llvm::outs() << "specific port" << port.name << " of module " << op.moduleName() << " with zero latency found.\n";
+              inputPath = new TimingPathNodeOp(0.0, portValue, nullptr, false /* cst */, bitIndex);
+              valuesLatency[std::make_pair(portValue, bitIndex)] = inputPath;
+            } else {
+              llvm::outs() << "latency for input " << port.name << " of module " << op.moduleName() << " has not been determined yet.\n";
+              return false;
+            }
           }
+          // todo/fixme: upgrade latencyByPortName to support bit index
+          // latencyByPortName[std::make_pair(port.getName(), bitIndex)] = inputPath;
+          latencyByPortName[port.getName()] = inputPath;
         }
-        latencyByPortName[port.getName()] = inputPath;
       }
       // processing outputs
       for (unsigned portIdx = 0, e = moduleTimingInfo->portInfo.size(); portIdx != e; ++portIdx) {
@@ -805,7 +897,8 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
         if (!port.isOutput()) continue;
 
         StringRef portName = port.getName();
-        ModulePathTimingInfo* path = moduleTimingInfo->getPathFromOutput(portName);
+        // todo/fixme: add support for bit-index
+        ModulePathTimingInfo* path = moduleTimingInfo->getPathFromOutput(portName, -1);
         if (path) { // todo: should check if port.getName() appears in map
           auto newPath = path->path.endPoint->copyPathUpstream();
           auto internalPathStart = newPath->getPathFirstNode(true /* discardCurrent*/ );
@@ -813,7 +906,8 @@ struct ExprLatencyEvaluator : public FIRRTLVisitor<ExprLatencyEvaluator, bool> {
           // its start to the path outside the instantiated module
           if (!isRegister(internalPathStart->nodeOp))
             internalPathStart->previousNode = latencyByPortName[path->startLabel];
-          valuesLatency[op->getOpResult(portIdx)] = newPath->getPathLastNode();
+        // todo/fixme: add support for bit-index
+          valuesLatency[std::make_pair(op->getOpResult(portIdx), 0)] = newPath->getPathLastNode();
         } else {
           llvm::errs() << "could not find internal path for output port " << portName << " of module " << op.moduleName() << ".\n";
           for (auto port : moduleTimingInfo->pathFromOutput) {
@@ -911,7 +1005,8 @@ void CriticalPathAnalysisPass::runOnOperation() {
     bool latencyFound = latencyEvaluator.dispatchExprVisitor(op);
 
     if (latencyFound) {
-      auto& path = latencyEvaluator.valuesLatency[op->getOpResult(0)];
+      // todo/fixme: add support for bit-index
+      auto& path = latencyEvaluator.valuesLatency[std::make_pair(op->getOpResult(0), 0)];
       if (!path) {
         LLVM_DEBUG(llvm::dbgs()
                   << "invalid latency for op " << op->getName().getStringRef().str() << "\n");
