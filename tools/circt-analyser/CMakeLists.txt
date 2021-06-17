@@ -1,0 +1,44 @@
+set(LLVM_LINK_COMPONENTS
+  Support
+  )
+
+add_llvm_tool(circt-analyser
+ circt-analyser.cpp
+)
+llvm_update_compile_flags(circt-analyser)
+target_link_libraries(circt-analyser PRIVATE
+  CIRCTExportVerilog
+  CIRCTImportFIRRTL
+  CIRCTFIRRTLToHW
+  CIRCTFIRRTLTransforms
+  CIRCTSVTransforms
+  CIRCTTransforms
+  CIRCTFIRRTLTransforms
+  CIRCTESI
+  CIRCTFIRRTL
+  CIRCTFIRRTLToLLHD
+  CIRCTFIRRTLToHW
+  CIRCTHandshakeOps
+  CIRCTHandshakeToFIRRTL
+  CIRCTLLHD
+  CIRCTLLHDToLLVM
+  CIRCTLLHDTransforms
+  CIRCTMSFT
+  CIRCTHW
+  CIRCTHWToLLHD
+  CIRCTSeq
+  CIRCTStandardToHandshake
+  CIRCTStandardToStaticLogic
+  CIRCTStaticLogicOps
+  CIRCTSV
+
+  MLIRIR
+  MLIRLLVMIR
+  MLIRMemRef
+  MLIROptLib
+  MLIRParser
+  MLIRStandard
+  MLIRSupport
+  MLIRTransforms
+  MLIRTranslation
+  )
